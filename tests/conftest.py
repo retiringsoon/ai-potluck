@@ -217,3 +217,27 @@ def signed_authorization(
         key_id=key_id,
     )
     return authorization.sign(keyring.private[key_id], key_id)
+
+_PROXY_VARS = (
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
+
+
+@pytest.fixture(autouse=True)
+def _scrub_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep operator proxy settings out of tests.
+
+    Development shells often export HTTP(S)_PROXY (a system-wide tunnel, for
+    example). Without this fixture every loopback dial in the suite would be
+    routed into that tunnel and fail. Tests that exercise proxy behavior set
+    their own variables explicitly through monkeypatch.
+    """
+    for name in _PROXY_VARS:
+        monkeypatch.delenv(name, raising=False)

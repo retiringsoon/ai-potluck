@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
+from aipotluck.proxy import http_connection_for
 from aipotluck.tls import client_ssl_context
 
 from .adapters import Adapter, FakeUpstreamAdapter, HttpUpstreamAdapter
@@ -717,12 +718,9 @@ def _consumer_request(
     if payload is not None:
         headers["content-type"] = "application/json"
         headers["content-length"] = str(len(payload))
-    connection = (
-        http.client.HTTPSConnection(
-            context=client_ssl_context(), host=host, port=port,
-            timeout=CONSUMER_HTTP_TIMEOUT_S)
-        if scheme == "https"
-        else http.client.HTTPConnection(host, port, timeout=CONSUMER_HTTP_TIMEOUT_S)
+    connection = http_connection_for(
+        scheme, host, port, timeout_s=CONSUMER_HTTP_TIMEOUT_S,
+        tls_context=client_ssl_context(),
     )
     try:
         connection.request(method, path, body=payload, headers=headers)
@@ -834,11 +832,9 @@ def consumer_events(
     token = consumer["token"]
     scheme, host, port = _consumer_parts(consumer)
     path = f"/v1/requests/{request_id}/events?cursor={cursor}"
-    connection = (
-        http.client.HTTPSConnection(
-            context=client_ssl_context(), host=host, port=port, timeout=timeout_s)
-        if scheme == "https"
-        else http.client.HTTPConnection(host, port, timeout=timeout_s)
+    connection = http_connection_for(
+        scheme, host, port, timeout_s=timeout_s,
+        tls_context=client_ssl_context(),
     )
     try:
         connection.request(
@@ -925,11 +921,9 @@ class SignedClient:
         if body_bytes is not None:
             headers["content-type"] = "application/json"
             headers["content-length"] = str(len(body_bytes))
-        connection = (
-            http.client.HTTPSConnection(
-            context=client_ssl_context(), host=host, port=port, timeout=timeout_s)
-            if scheme == "https"
-            else http.client.HTTPConnection(host, port, timeout=timeout_s)
+        connection = http_connection_for(
+            scheme, host, port, timeout_s=timeout_s,
+            tls_context=client_ssl_context(),
         )
         try:
             connection.request(method, target, body=body_bytes, headers=headers)
@@ -996,11 +990,9 @@ class SignedClient:
             key_id=self.key_id, issued_at=issued_at, nonce=nonce, signature_b64=signature
         )
         scheme, host, port = _consumer_parts({"center_url": self.center_url})
-        connection = (
-            http.client.HTTPSConnection(
-            context=client_ssl_context(), host=host, port=port, timeout=timeout_s)
-            if scheme == "https"
-            else http.client.HTTPConnection(host, port, timeout=timeout_s)
+        connection = http_connection_for(
+            scheme, host, port, timeout_s=timeout_s,
+            tls_context=client_ssl_context(),
         )
         try:
             connection.request(

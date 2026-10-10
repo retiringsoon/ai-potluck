@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 
+from aipotluck.proxy import http_connection_for
 from aipotluck.tls import client_ssl_context
 
 from .canonical import loads_strict
@@ -573,15 +574,14 @@ class HttpUpstreamAdapter:
     def _connect(self, parts: Any) -> http.client.HTTPConnection:
         """Open a connection to the configured endpoint."""
         host = str(parts.hostname)
-        if parts.scheme == "https":
-            context = self.ssl_context or client_ssl_context()
-            return http.client.HTTPSConnection(
-                host,
-                parts.port or 443,
-                timeout=self.timeout_s,
-                context=context,
-            )
-        return http.client.HTTPConnection(str(host), parts.port or 80, timeout=self.timeout_s)
+        context = self.ssl_context or client_ssl_context()
+        return http_connection_for(
+            parts.scheme,
+            host,
+            parts.port or (443 if parts.scheme == "https" else 80),
+            timeout_s=self.timeout_s,
+            tls_context=context,
+        )
 
     def _encode_body(self, payload: dict[str, Any]) -> bytes:
         """Serialize a request body to its exact wire bytes."""

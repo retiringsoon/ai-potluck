@@ -39,6 +39,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import NoReturn, Self, cast
 
+from aipotluck.proxy import connect_via, resolve_proxy
 from aipotluck.tls import client_ssl_context
 
 from .errors import PotluckError
@@ -633,7 +634,11 @@ class ClientConnection(_Connection):
         resource = parts.path or "/"
         if parts.query:
             resource = f"{resource}?{parts.query}"
-        sock: socket.socket = socket.create_connection((host, port), timeout=timeout)
+        proxy = resolve_proxy(parts.scheme, host)
+        if proxy is not None:
+            sock: socket.socket = connect_via(proxy, host, port, timeout)
+        else:
+            sock = socket.create_connection((host, port), timeout=timeout)
         try:
             if secure:
                 context = ssl_context if ssl_context is not None else client_ssl_context()

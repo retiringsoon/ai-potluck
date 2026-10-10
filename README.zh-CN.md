@@ -194,6 +194,21 @@ potluck-server admin reconcile --config center.json
 或乱序，但发现不了“中心重写历史后重新签名”。把 `GET /v1/checkpoint` 的
 `public_key_b64` 带外固定下来，才能封住这个缺口。
 
+## 代理环境
+
+出站连接（ask/request 到中心、节点 WebSocket、节点到上游）遵循标准代理变量：
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7897 potluck ask "你好" --stream
+```
+
+- `https`/`wss` 目的地读取 `HTTPS_PROXY`，其次 `ALL_PROXY`；`http`/`ws`
+  目的地读取 `HTTP_PROXY`，其次 `ALL_PROXY`
+- 支持 HTTP CONNECT 代理（`http://`、`https://`）与 SOCKS5
+  （`socks5://`，域名由代理解析），可选 `user:pass@` 认证
+- `NO_PROXY` 排除目的地（`*`、精确主机、后缀域名）；`localhost`、
+  `127.0.0.0/8`、`::1` 等本机地址永远直连
+
 ## 供给合规
 
 本项目只支持 L1 白名单供给：自有 API key、自部署模型、或合同允许你转售的企业

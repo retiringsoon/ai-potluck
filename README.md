@@ -221,6 +221,22 @@ same center that serves the receipt, which detects a lost or reordered log but
 not a center that rewrote history and re-signed it. Pin `public_key_b64` from
 `GET /v1/checkpoint` out of band to close that gap.
 
+## Behind a proxy
+
+Outbound dials (ask/request to the center, the node-link WebSocket, and the
+node's upstream call) honor the standard proxy variables:
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7897 potluck ask "hello" --stream
+```
+
+- `https`/`wss` destinations read `HTTPS_PROXY`, then `ALL_PROXY`; `http`/`ws`
+  destinations read `HTTP_PROXY`, then `ALL_PROXY`
+- both HTTP CONNECT proxies (`http://`, `https://`) and SOCKS5
+  (`socks5://`, remote DNS) are supported, with optional `user:pass@` auth
+- `NO_PROXY` excludes destinations (`*`, exact hosts, suffix domains); the
+  loopback addresses `localhost`, `127.0.0.0/8`, and `::1` are always direct
+
 ## Supply compliance
 
 The project supports only L1 whitelist supply: your own API key, a self-hosted
