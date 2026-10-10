@@ -149,10 +149,10 @@ def test_python_versions_outside_the_range_are_refused(version: str, supported: 
 @pytest.mark.parametrize(
     ("source", "is_spec"),
     [
-        ("potluck @ git+https://host/repo@v0.1.0#subdirectory=apps/ai_share", True),
+        ("potluck @ git+https://host/repo@v0.1.0#subdirectory=apps/client", True),
         ("git+ssh://git@host/repo@main", True),
         ("https://host/potluck-0.1.0-py3-none-any.whl", True),
-        ("/tmp/checkout/apps/ai_share", False),
+        ("/tmp/checkout/apps/client", False),
         (".", False),
     ],
 )
