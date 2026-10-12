@@ -28,6 +28,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -1511,3 +1512,70 @@ def test_a_request_the_endpoint_cannot_sign_is_a_local_error_not_an_upstream_one
     assert "could not sign this request" in document["error"]["message"]
     assert str(identity.directory) in document["error"]["message"]
     assert center.admitted == []
+
+
+# --------------------------------------------------------------------------- #
+# The configuration a tool is handed, used against the endpoint that serves it
+# --------------------------------------------------------------------------- #
+
+
+def test_the_emitted_configuration_is_a_configuration_that_works(
+    center: FakeCenter,
+    endpoint: Callable[..., LocalEndpointServer],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Emit, then use: what ``config emit`` prints is a working configuration.
+
+    Both families, against the endpoint that is really listening. The two base
+    URLs differ by one path segment — an OpenAI client appends
+    ``chat/completions`` to what it is given, Claude Code appends ``/v1/messages``
+    itself — and the difference is only visible by making the request each block
+    describes. The routes are derived from the emitted strings rather than written
+    down again, so this test cannot pass on a configuration that a tool would
+    read differently.
+    """
+    center.answer_with(deltas=DELTAS)
+    server = endpoint()
+
+    assert main(["config", "emit", "--shell", "--port", str(server.port)]) == 0
+    shell_block = capsys.readouterr().out
+    assert main(
+        ["config", "emit", "--claude-code", "--port", str(server.port), "--model", MODEL]
+    ) == 0
+    claude_document = json.loads(capsys.readouterr().out)
+
+    exported: dict[str, str] = {}
+    for line in shell_block.splitlines():
+        if not line.startswith("export "):
+            continue
+        name, _, value = line.removeprefix("export ").partition("=")
+        exported[name] = value.strip('"')
+    openai_base = exported["OPENAI_BASE_URL"]
+    anthropic_base = claude_document["env"]["ANTHROPIC_BASE_URL"]
+    assert openai_base == server.base_url, "the emitter and the endpoint agree"
+    assert anthropic_base == server.anthropic_base_url
+    assert exported["OPENAI_API_KEY"] == LOCAL_API_KEY_PLACEHOLDER
+
+    openai_route = f"{urlsplit(openai_base).path}/chat/completions"
+    status, _headers, document, _raw = _call(server, "POST", openai_route, _chat())
+    assert status == 200
+    assert document["choices"][0]["message"]["content"] == ANSWER
+
+    anthropic_route = f"{urlsplit(anthropic_base).path}/v1/messages"
+    status, _headers, document, _raw = _call(
+        server,
+        "POST",
+        anthropic_route,
+        {"model": MODEL, "max_tokens": 64,
+         "messages": [{"role": "user", "content": "what settles a request?"}]},
+    )
+    assert status == 200
+    assert document["content"][0]["text"] == ANSWER
+    assert claude_document["env"]["ANTHROPIC_MODEL"] == MODEL
+
+    status, _headers, document, _raw = _call(
+        server, "GET", f"{urlsplit(openai_base).path}/models"
+    )
+    assert status == 200
+    assert [model["id"] for model in document["data"]] == [MODEL]
+    assert len(center.admitted) == 2, "one request per completion route, none for the list"
