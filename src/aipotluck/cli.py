@@ -50,6 +50,13 @@ Onboarding and consumer commands (the invite flow):
   (the display is a replaceable function so a streaming worker can make it
   incremental).
 * ``version`` prints the package and protocol versions.
+* ``serve-openai`` runs a loopback-only HTTP endpoint that speaks the shapes
+  tools already use — OpenAI's ``POST /v1/chat/completions`` and ``GET
+  /v1/models``, and Anthropic's ``POST /v1/messages``, which is what Claude Code
+  speaks — and turns each request into one on the same signed consumer path
+  ``ask`` uses, so a tool needs a ``base_url`` and no potluck-specific code. The
+  endpoint lives in :mod:`aipotluck.localapi` and the tool-facing wire shapes in
+  :mod:`aipotluck.openai_wire`.
 
 The payload is parsed with :func:`aipotluck.canonical.loads_strict` on both the
 signing and verification path. That is deliberate: a payload the signer would
@@ -223,12 +230,18 @@ EXIT_CANCELLED = 130
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the argument parser with the ``keygen``, ``sign`` and ``verify`` subcommands.
+    """Build the argument parser with one subparser per command.
 
     Returns:
         The fully configured parser. Each subparser records its handler via
         ``set_defaults`` so dispatch needs no separate table.
     """
+    # Function-local, as every import of :mod:`aipotluck.localapi` in this module
+    # is: that module drives the consumer seams defined here, so the dependency
+    # runs one way and a module-level import would be a cycle. Its constants are
+    # read here rather than restated, so a default can be written down once.
+    from . import localapi
+
     parser = argparse.ArgumentParser(
         prog=PROG,
         description=(
@@ -571,6 +584,81 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print a machine-readable document.",
     )
     ask.set_defaults(handler=_cmd_ask)
+
+    serve_openai = subparsers.add_parser(
+        "serve-openai",
+        help="Serve this machine's identity to local tools as an OpenAI/Anthropic endpoint.",
+        description=(
+            "Run a loopback HTTP endpoint that accepts the request shapes tools "
+            "already speak — OpenAI's POST /v1/chat/completions and GET "
+            "/v1/models, and Anthropic's POST /v1/messages, which is what Claude "
+            "Code speaks — and turns each one into a request on this machine's own "
+            "signed consumer path, exactly as `ask` does. Buffered and streaming "
+            "answers are both served, and a request that does not reach SUCCEEDED "
+            "is answered as an error naming the platform's request id and the way "
+            "to check what it cost.\n\n"
+            "The endpoint binds an IPv4 loopback address and refuses to start on "
+            "anything else, and it checks no API key: any process able to open a "
+            "loopback port could equally run `ask` against the same key file, so "
+            "loopback reachability *is* the threat model rather than a key check "
+            "that would add a prompt and no boundary. What loopback binding does "
+            "buy is the property that matters: the signing key never leaves this "
+            "machine, which is the difference from the center's own "
+            "OpenAI-compatible surface at <center-url>/openai/v1, where the center "
+            "holds bounded spending authority over a key it issued.\n\n"
+            f"Point a tool at it with `{PROG} config emit --shell` or "
+            f"`{PROG} config emit --claude-code`."
+        ),
+    )
+    _add_config_dir_argument(serve_openai)
+    serve_openai.add_argument(
+        "--host",
+        default=localapi.LOOPBACK_HOST,
+        help=(
+            "Address to bind. An IPv4 loopback address only; 0.0.0.0, ::, a "
+            "public address and a hostname are all refused, because an endpoint "
+            "that spends this identity must not be reachable from another "
+            f"machine (default {localapi.LOOPBACK_HOST})."
+        ),
+    )
+    serve_openai.add_argument(
+        "--port",
+        type=int,
+        default=localapi.DEFAULT_PORT,
+        help=f"Port to listen on (default {localapi.DEFAULT_PORT}).",
+    )
+    serve_openai.add_argument(
+        "--max-charge",
+        type=int,
+        default=ASK_DEFAULT_MAX_CHARGE,
+        dest="max_charge",
+        metavar="MILLI_CREDITS",
+        help=(
+            "Charge ceiling signed into every authorization this endpoint mints "
+            f"(default {ASK_DEFAULT_MAX_CHARGE})."
+        ),
+    )
+    serve_openai.add_argument(
+        "--timeout",
+        type=float,
+        default=ASK_DEFAULT_TIMEOUT_S,
+        help=(
+            "Seconds one request waits for a terminal status "
+            f"(default {ASK_DEFAULT_TIMEOUT_S:g})."
+        ),
+    )
+    serve_openai.add_argument(
+        "--no-node-grace",
+        type=float,
+        default=ASK_NO_NODE_GRACE_S,
+        dest="no_node_grace",
+        metavar="SECONDS",
+        help=(
+            "How long an empty node list is tolerated before a request is "
+            f"reported as unroutable (default {ASK_NO_NODE_GRACE_S:g})."
+        ),
+    )
+    serve_openai.set_defaults(handler=_cmd_serve_openai)
 
     doctor = subparsers.add_parser(
         "doctor",
@@ -1554,6 +1642,20 @@ class NoAvailableNodes(PotluckError):
     """
 
 
+class WaitDeadline(PotluckError):
+    """Raised when a wait window closed while the request was still unfinished.
+
+    A distinct type rather than a message match, for the same reason as
+    `NoAvailableNodes`: a deadline is not a refusal. The work may still be
+    running at the center and may still be billed, so
+    :mod:`aipotluck.localapi` answers it as ``504 deadline_passed`` with the
+    billing-honest message, while a center refusal is answered with the code the
+    center itself named. Telling those apart by parsing a message is how a
+    request that may still cost something comes to be reported as a failure of
+    the platform.
+    """
+
+
 #: The terminal states whose ``billing_note`` ``ask`` surfaces. A succeeded
 #: request has nothing to explain, and a cancelled one was stopped by the user
 #: who is reading the screen, so only the two states that mean "the platform
@@ -1681,7 +1783,8 @@ def _await_terminal(
 
     Raises:
         NoAvailableNodes: If no node advertised the model for the whole grace.
-        PotluckError: If the deadline passed, or the user cancelled.
+        WaitDeadline: If the wait window closed with the request unfinished.
+        PotluckError: If the user cancelled, or a read of the center failed.
     """
     deadline = time.monotonic() + timeout_s
     empty_since: float | None = None
@@ -1704,7 +1807,7 @@ def _await_terminal(
                 f"can run model {model!r})"
             )
         if now >= deadline:
-            raise PotluckError(
+            raise WaitDeadline(
                 f"request {request_id} did not reach a terminal state within "
                 f"{timeout_s:g}s; last status {document.get('status')!r}"
             )
@@ -1992,7 +2095,8 @@ def run_buffered_answer(
 
     Raises:
         NoAvailableNodes: If no node advertised the model for the whole grace.
-        PotluckError: On the deadline, or a transport failure.
+        WaitDeadline: If the wait window closed with the request unfinished.
+        PotluckError: On a transport failure, or a cancellation.
     """
     presenter.status("waiting for generation...")
     document = _await_terminal(
@@ -2374,6 +2478,30 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         )
         return EXIT_CANCELLED
     return 0 if final_status == "SUCCEEDED" else 1
+
+
+def _cmd_serve_openai(args: argparse.Namespace) -> int:
+    """Run ``serve-openai``: the loopback endpoint until SIGINT/SIGTERM.
+
+    The endpoint raises rather than printing its own refusals, so a non-loopback
+    ``--host``, a port that is busy and a config directory with no identity in it
+    all reach `main`'s one error path and exit non-zero: a refusal to start is
+    never a silent one.
+    """
+    # Function-local: `localapi` drives this module's consumer seams, so the
+    # dependency runs one way and a module-level import would be a cycle.
+    from . import localapi
+
+    return localapi.serve_openai(
+        settings=localapi.EndpointSettings(
+            host=args.host,
+            port=args.port,
+            max_charge=args.max_charge,
+            timeout_s=args.timeout,
+            no_node_grace_s=args.no_node_grace,
+        ),
+        config_dir=_config_dir(args.config_dir),
+    )
 
 
 # --------------------------------------------------------------------------
