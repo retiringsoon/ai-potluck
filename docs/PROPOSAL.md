@@ -183,36 +183,46 @@ Everything above is covered by ~1900 tests, `ruff`, and `mypy --strict` (zero fi
 Full version: [ROADMAP.md](ROADMAP.md). Short version:
 
 - **Shipped (v0.1.0):** everything under "What works today".
-- **Next (committed):** **OpenAI-compatible API access** (see below) so any existing tool consumes
-  the pool directly; extract to a standalone public repo; CLI output internationalization
-  (strings are currently Chinese); multiple models per node; a Windows story beyond WSL; a
-  hardening batch (invite-consumption ordering, revocation semantics, a cosmetic status flicker).
+- **Shipped since v0.1.0:** **OpenAI-compatible API access** (see below) — any existing tool
+  consumes the pool directly with a center-issued API key.
+- **Next (committed):** a local signing proxy for that surface; tool calling over it; extract to a
+  standalone public repo; CLI output internationalization (strings are currently Chinese);
+  multiple models per node; a Windows story beyond WSL; a hardening batch (invite-consumption
+  ordering, revocation semantics, a cosmetic status flicker).
 - **Considering — your feedback decides:** credit top-up flows, per-model pricing, automated
   dispute flow, a platform-observed metering proxy, TEE-attested metering, x402-style per-call
   payments, a Docker image, a minimal local chat UI.
 
-### Coming next: use it from any tool (OpenAI-compatible API)
+### Shipped: use it from any tool (OpenAI-compatible API)
 
-`ask` proves the pipeline; for real work you shouldn't have to leave your tools. The next
-milestone exposes the pool as an **OpenAI-compatible endpoint**:
+`ask` proves the pipeline; for real work you shouldn't have to leave your tools. The center now
+serves an **OpenAI-compatible endpoint** alongside its own API:
 
 ```text
-base_url = https://<your-center>/v1
-api_key  = <an potluck API key>
+base_url = https://<your-center>/openai/v1
+api_key  = ak-…   (potluck-server admin api-key)
 model    = <whatever your group's nodes serve>
 ```
 
-- The center issues **revocable API keys bound to your account, each with a credit cap**. Every
-  tool request is authorized automatically *within that cap* — same reservation, settlement,
-  signed receipts and transparency log as today; nothing about the audit story changes.
-- Agent loops (tool calls, multi-turn) work natively: each turn is one request, your agent keeps
-  its own context, and per-key/per-request costs stay reconcilable.
-- Honest tradeoff: with a center-issued key, the center auto-signs the per-request authorization
-  inside your cap — you extend it bounded spending authority, revocable at any moment. For those
-  who want signing to stay client-side (design principle #1, symmetric with the contributor
-  connector), a small **local signing proxy** is planned alongside.
-- This also unlocks long-running agent tasks: an agent loop against the endpoint needs zero
-  potluck-specific configuration beyond the base URL and key.
+- The center issues **revocable API keys bound to an existing consumer, each with a credit cap**,
+  plus a per-key concurrency ceiling and request rate. Every tool request is authorized
+  automatically *within that cap* — same reservation, settlement, signed receipts and
+  transparency log as a signed request; nothing about the audit story changes, and the key's
+  spend is counted against its quota in the same transaction that records the settlement.
+- **Multi-turn works, and it is the point**: the internal request model carries the conversation
+  itself rather than a flattened prompt, so every turn reaches the contributor's upstream
+  verbatim together with the parameters the platform forwards. Each request is one authorized
+  spend, and per-key/per-request costs stay reconcilable.
+- Honest limits: no embeddings, no legacy completions endpoint, one text choice (`n > 1` is
+  ignored) and **no tool calling** — `tools`/`tool_choice` are not forwarded, so an agent
+  framework that drives a conversation through tool calls needs the signed `/v1/*` path. Those
+  refusals are explicit (`404`, `error.type: not_supported`) rather than silent.
+- Honest tradeoff: with a center-issued key, the center signs the per-request authorization
+  inside your cap with the platform settlement key, labelled `auth_method:
+  gateway_authenticated`. You extend it bounded spending authority, revocable at any moment, and
+  `verify receipt` reports such a receipt truthfully — as platform-authorized, **not** as a
+  consumer signature. For those who want signing to stay client-side (design principle #1,
+  symmetric with the contributor connector), a small **local signing proxy** is still planned.
 
 ## What we're asking early users
 

@@ -140,15 +140,58 @@ document.
 
 ### Using it from your own tools
 
-Today the consumer surface is the CLI: `ask` for people, `potluck request
---json` for scripts (submit, poll the status document, read the answer and
-receipt). The wire protocol itself is public and stable — signing, endpoints,
-and event streams are specified in the
-[network contract v0.1](docs/network-contract-v0.1.md) — so anything that can
-sign Ed25519 and speak HTTPS can integrate without the CLI. An
-OpenAI-compatible endpoint (a drop-in `base_url` for existing IDE and chat
-clients) is on the [roadmap](docs/ROADMAP.md); until it ships, a tiny wrapper
-over `potluck request` is the supported integration path.
+Two ways in, and they differ in what proves the spend was authorized.
+
+**An OpenAI-compatible endpoint** — the drop-in path. The center serves
+`POST /openai/v1/chat/completions` and `GET /openai/v1/models`, authenticated
+with an API key the operator mints for your consumer identity:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://<center>/openai/v1",   # the center, not a provider
+    api_key="ak-…",                          # potluck-server admin api-key
+)
+client.chat.completions.create(
+    model="coding-pool",
+    messages=[{"role": "user", "content": "what settles a request?"}],
+)
+```
+
+Your conversation reaches the contributing node's upstream **verbatim** — every
+turn, not a flattened prompt — together with the parameters the platform
+forwards (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `user`, …).
+Streaming works, `usage` reports what the center actually billed, and the key is
+capped by its own quota, revocable without a restart, and rate-limited. Not
+implemented, and refused by name rather than silently: embeddings, the legacy
+completions endpoint, `n > 1` and tool calling. The full reference — parameters,
+error table, limits — is
+[ai-potluck-server/docs/openai-endpoint.md](../ai-potluck-server/docs/openai-endpoint.md).
+
+**The platform's own `/v1/*` API** — the signed path. The wire protocol is
+public and stable, specified in the
+[network contract v0.1](docs/network-contract-v0.1.md), so anything that can sign
+Ed25519 and speak HTTPS can integrate without the CLI; `potluck request --json`
+is the scripting front end over it.
+
+Both paths land in the same books: same metering, same settlement, same
+transparency log, same receipts, and `verify receipt` and `share reconcile` work
+over either. One difference is worth stating plainly, because it is a difference
+in *evidence* rather than in bookkeeping: a signed request carries **your own**
+signature over the exact work and ceiling, while an API-key request carries an
+authorization the **platform** signed with its settlement key, labelled
+`auth_method: gateway_authenticated` — the protocol's second method. Verification
+follows the label, so an API-key receipt verifies honestly and reports
+`signature_valid: pass`; it is not presented as a consumer signature, and it does
+not prove the same thing. What it proves is that the center admitted these terms
+for this subject and billed exactly this amount, which is what the receipt, the
+log and the reconciliation were for. An `auth_method` a build does not define is
+reported as an anomaly rather than passed under a guessed purpose.
+
+A local signing proxy — your keys stay client-side, symmetric with the
+contributor connector — is still on the [roadmap](docs/ROADMAP.md) for callers
+who want consumer-signed authorization without writing the signing themselves.
 
 ### Good to know
 
