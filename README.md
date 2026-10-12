@@ -3,11 +3,30 @@
 [![ci](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml/badge.svg)](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml)
 
 
-A trust layer for communities pooling AI quota. Contributors
-run a connector on their own machine and share idle model capacity without ever
-handing over their upstream credentials. Consumers pay per use in credits, and
-every charge produces a signed receipt plus a transparency-log entry that can be
-verified offline.
+## Why ai-potluck
+
+Communities already share AI access informally — a friend's API key pasted into
+a group chat, a team seat "borrowed" by five people, a subscription passed
+around. It works until it doesn't: nobody can say who spent what, the person
+lending carries all the risk, and every dispute ends at "trust me".
+
+ai-potluck turns that handshake into infrastructure:
+
+- **Contributors pool capacity, not credentials.** A contributor runs a
+  connector on their own machine; upstream keys never leave it, and sharing is
+  revocable at any moment.
+- **Consumers pay per use, in the open.** Work is billed in milli-credits with
+  a hard budget ceiling — no subscriptions, no deposits, no key sharing.
+- **Every charge is provable.** Each answer produces a signed receipt and a
+  transparency-log entry anyone can verify offline (`potluck verify receipt`) —
+  and interrupted work is reconciled, not guessed.
+- **The center keeps the books, not the power.** It routes, meters, and
+  settles; it never sees an upstream credential, and clients can check its
+  arithmetic against the public ledger.
+
+Supply is invite-only and consent-based — see
+[Supply compliance](#supply-compliance).
+
 
 This repository is the client side: the `potluck` command, the connector, and
 the protocol and verification core. Module layout follows one rule — the
