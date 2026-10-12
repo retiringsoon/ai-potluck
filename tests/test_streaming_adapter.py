@@ -26,10 +26,14 @@ from aipotluck.adapters import (
     SSEFrame,
     iter_sse_events,
 )
-from aipotluck.canonical import loads_strict
+from aipotluck.wire import ChatMessage, encode_chat_parameters, user_message
 
 #: A responder receives the live request handler and writes the response itself.
 Responder = Callable[[http.server.BaseHTTPRequestHandler], None]
+
+#: The single-turn conversation most of these tests run. The adapter is a proxy,
+#: so what it posts is asserted against exactly this.
+MESSAGES = (user_message("prompt"),)
 
 
 def _sse(data: str, *, event: str | None = None) -> bytes:
@@ -139,7 +143,11 @@ class StubServer:
                 length = int(self.headers.get("content-length", "0") or "0")
                 raw = self.rfile.read(length)
                 try:
-                    body: Any = loads_strict(raw) if raw else {}
+                    # `json.loads` rather than the platform's own strict parser:
+                    # this records what an upstream would have received, and a
+                    # real provider accepts the fractional parameters the
+                    # adapter forwards as JSON numbers.
+                    body: Any = json.loads(raw) if raw else {}
                 except Exception:
                     body = {"__unparseable__": raw.decode("utf-8", "replace")}
                 outer.requests.append(
@@ -223,7 +231,7 @@ def test_openai_stream_request_asks_for_a_stream_and_usage(
     )
     adapter = _adapter(server.url)
 
-    chunks = list(adapter.stream("prompt", request_digest="sha256:req"))
+    chunks = list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
     server.raise_errors()
     body = server.last_body
@@ -261,7 +269,7 @@ def test_complete_still_asks_for_a_buffered_body(
     server = upstream_server(responder)
     adapter = _adapter(server.url)
 
-    result = adapter.complete("prompt", request_digest="sha256:req")
+    result = adapter.complete(MESSAGES, request_digest="sha256:req", parameters={})
 
     server.raise_errors()
     assert server.last_body["stream"] is False
@@ -279,13 +287,145 @@ def test_anthropic_stream_requests_its_own_body_shape(
     )
     adapter = _adapter(server.url, style="anthropic")
 
-    list(adapter.stream("prompt", request_digest="sha256:req"))
+    list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
     server.raise_errors()
     body = server.last_body
     assert body["stream"] is True
     assert body["max_tokens"] == 1024
     assert "stream_options" not in body
+
+
+def test_every_turn_reaches_the_upstream_verbatim(
+    upstream_server: Callable[[Responder], StubServer],
+) -> None:
+    """A conversation is forwarded whole: no turn dropped, no content rewritten.
+
+    The node is a proxy for one provider call, so the multi-turn context the
+    requester paid for has to be the context the model answers from. A
+    center-or-adapter that flattened the conversation into one prompt string
+    would still return an answer, which is exactly why the assertion is on the
+    body the upstream received rather than on the reply.
+    """
+    conversation = (
+        ChatMessage(role="system", content="answer in one word"),
+        ChatMessage(role="user", content="what settles a potluck request?"),
+        ChatMessage(role="assistant", content="a receipt"),
+        ChatMessage(
+            role="user",
+            content=({"type": "text", "text": "and what backs the receipt?"},),
+        ),
+    )
+    server = upstream_server(
+        lambda handler: _write_sse(handler, [_openai_delta("hi"), OPENAI_DONE])
+    )
+    adapter = _adapter(server.url)
+
+    list(adapter.stream(conversation, request_digest="sha256:req", parameters={}))
+
+    server.raise_errors()
+    assert server.last_body["messages"] == [
+        {"role": "system", "content": "answer in one word"},
+        {"role": "user", "content": "what settles a potluck request?"},
+        {"role": "assistant", "content": "a receipt"},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "and what backs the receipt?"}],
+        },
+    ]
+
+
+def test_forwarded_parameters_reach_the_upstream_as_its_own_types(
+    upstream_server: Callable[[Responder], StubServer],
+) -> None:
+    """The canonical wire encoding is undone at the upstream boundary.
+
+    Fractions travel as decimal strings, because the platform's canonical
+    encoding refuses floats; an upstream that received ``"temperature": "0.7"``
+    would reject a request the platform accepted. Everything else keeps the JSON
+    type it was forwarded with.
+    """
+    parameters = encode_chat_parameters(
+        {
+            "temperature": 0.7,
+            "top_p": 1,
+            "max_tokens": 64,
+            "stop": ["\n", "END"],
+            "user": "consumer-X",
+            "logit_bias": {"50256": -100},
+        }
+    )
+    assert parameters["temperature"] == "0.7", "a fraction travels as a decimal string"
+    server = upstream_server(
+        lambda handler: _write_sse(handler, [_openai_delta("hi"), OPENAI_DONE])
+    )
+    adapter = _adapter(server.url)
+
+    list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters=parameters))
+
+    server.raise_errors()
+    body = server.last_body
+    assert body["temperature"] == 0.7
+    assert body["top_p"] == 1
+    assert body["max_tokens"] == 64
+    assert body["stop"] == ["\n", "END"]
+    assert body["user"] == "consumer-X"
+    assert body["logit_bias"] == {"50256": -100}
+
+
+def test_unlisted_and_null_parameters_are_not_forwarded(
+    upstream_server: Callable[[Responder], StubServer],
+) -> None:
+    """Only the documented set is forwarded, and an explicit null forwards nothing.
+
+    A parameter the requester has no opinion about must not override the
+    upstream's own default with a null, and a field the platform has not decided
+    to honour must not become an undocumented way to change what a node asks a
+    provider for.
+    """
+    parameters = encode_chat_parameters(
+        {"temperature": None, "n": 3, "logprobs": True, "top_logprobs": 2, "seed": 7}
+    )
+    assert parameters == {"seed": 7}
+    server = upstream_server(
+        lambda handler: _write_sse(handler, [_openai_delta("hi"), OPENAI_DONE])
+    )
+    adapter = _adapter(server.url)
+
+    list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters=parameters))
+
+    server.raise_errors()
+    body = server.last_body
+    assert body["seed"] == 7
+    for absent in ("temperature", "n", "logprobs", "top_logprobs"):
+        assert absent not in body
+
+
+def test_anthropic_system_message_becomes_its_own_field(
+    upstream_server: Callable[[Responder], StubServer],
+) -> None:
+    """The one reshaping the adapter does is the one Anthropic's API demands.
+
+    Anthropic takes system instructions as a top-level field rather than as a
+    turn, so forwarding them verbatim would be a request its API refuses.
+    """
+    conversation = (
+        ChatMessage(role="system", content="answer in one word"),
+        ChatMessage(role="user", content="hi"),
+    )
+    server = upstream_server(
+        lambda handler: _write_sse(
+            handler, [_anthropic_start(5), _anthropic_text("a"), ANTHROPIC_STOP]
+        )
+    )
+    adapter = _adapter(server.url, style="anthropic")
+
+    list(adapter.stream(conversation, request_digest="sha256:req", parameters={}))
+
+    server.raise_errors()
+    body = server.last_body
+    assert body["system"] == "answer in one word"
+    assert body["messages"] == [{"role": "user", "content": "hi"}]
 
 
 # --------------------------------------------------------------------------- #
@@ -305,7 +445,7 @@ def test_openai_stream_parses_text_usage_and_done(
     )
     adapter = _adapter(server.url)
 
-    chunks = list(adapter.stream("prompt", request_digest="sha256:req"))
+    chunks = list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
     server.raise_errors()
     assert "".join(chunk.text for chunk in chunks) == "Hello world"
@@ -326,7 +466,7 @@ def test_stream_skips_comment_and_heartbeat_lines(
     )
     adapter = _adapter(server.url)
 
-    chunks = list(adapter.stream("prompt", request_digest="sha256:req"))
+    chunks = list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
     server.raise_errors()
     assert [chunk.text for chunk in chunks] == ["x", ""]
@@ -343,7 +483,7 @@ def test_stream_joins_multiple_data_lines_into_one_frame(
     server = upstream_server(lambda handler: _write_sse(handler, [split_frame, OPENAI_DONE]))
     adapter = _adapter(server.url)
 
-    chunks = list(adapter.stream("prompt", request_digest="sha256:req"))
+    chunks = list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
     server.raise_errors()
     assert [chunk.text for chunk in chunks] == ["a", ""]
@@ -362,7 +502,7 @@ def test_frames_split_across_reads_are_reassembled(
     server = upstream_server(lambda handler: _write_sse(handler, pieces))
     adapter = _adapter(server.url)
 
-    chunks = list(adapter.stream("prompt", request_digest="sha256:req"))
+    chunks = list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
     server.raise_errors()
     assert "".join(chunk.text for chunk in chunks) == "Hello there"
@@ -388,7 +528,7 @@ def test_anthropic_stream_merges_usage_from_start_and_delta(
     )
     adapter = _adapter(server.url, style="anthropic")
 
-    chunks = list(adapter.stream("prompt", request_digest="sha256:req"))
+    chunks = list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
     server.raise_errors()
     assert "".join(chunk.text for chunk in chunks) == "Hello world"
@@ -458,7 +598,7 @@ def test_malformed_frame_is_rejected(
     adapter = _adapter(server.url)
 
     with pytest.raises(AdapterError):
-        list(adapter.stream("prompt", request_digest="sha256:req"))
+        list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
 
 def test_openai_stream_truncated_before_done_raises(
@@ -470,7 +610,7 @@ def test_openai_stream_truncated_before_done_raises(
 
     collected: list[str] = []
     with pytest.raises(AdapterError):
-        for chunk in adapter.stream("prompt", request_digest="sha256:req"):
+        for chunk in adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}):
             collected.append(chunk.text)
     assert "".join(collected) == "Hello ", "the text already produced is not lost"
 
@@ -485,7 +625,7 @@ def test_anthropic_stream_truncated_before_message_stop_raises(
     adapter = _adapter(server.url, style="anthropic")
 
     with pytest.raises(AdapterError):
-        list(adapter.stream("prompt", request_digest="sha256:req"))
+        list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
 
 def test_anthropic_error_event_is_rejected(
@@ -499,7 +639,7 @@ def test_anthropic_error_event_is_rejected(
     adapter = _adapter(server.url, style="anthropic")
 
     with pytest.raises(AdapterError):
-        list(adapter.stream("prompt", request_digest="sha256:req"))
+        list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
 
 def test_stream_reports_quota_exhaustion(
@@ -517,7 +657,7 @@ def test_stream_reports_quota_exhaustion(
     adapter = _adapter(server.url)
 
     with pytest.raises(AdapterQuotaExceeded):
-        list(adapter.stream("prompt", request_digest="sha256:req"))
+        list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
 
 def test_stream_reports_other_http_errors(
@@ -535,7 +675,7 @@ def test_stream_reports_other_http_errors(
     adapter = _adapter(server.url)
 
     with pytest.raises(AdapterError):
-        list(adapter.stream("prompt", request_digest="sha256:req"))
+        list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))
 
 
 def test_unreachable_upstream_is_unavailable() -> None:
@@ -549,4 +689,4 @@ def test_unreachable_upstream_is_unavailable() -> None:
     adapter = _adapter(f"http://127.0.0.1:{port}/v1/complete")
 
     with pytest.raises(AdapterError):
-        list(adapter.stream("prompt", request_digest="sha256:req"))
+        list(adapter.stream(MESSAGES, request_digest="sha256:req", parameters={}))

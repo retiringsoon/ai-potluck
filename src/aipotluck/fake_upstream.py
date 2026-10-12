@@ -12,11 +12,12 @@ than inferred from the absence of an error.
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from .metering import NormalizedUsage, normalize_anthropic_usage, normalize_openai_usage
+from .wire import ChatMessage
 
 FaultMode = Literal[
     "none",
@@ -38,13 +39,27 @@ class FakeResponse:
     provider_style: Literal["openai", "anthropic"] = "openai"
 
 
+@dataclass(frozen=True)
+class FakeUpstreamCall:
+    """One call the fake upstream received, exactly as the adapter forwarded it.
+
+    Recorded so a test can assert on what reached the upstream rather than on
+    what the caller meant to send: a conversation that lost a turn, or a
+    parameter the platform silently dropped, is visible only here.
+    """
+
+    request_digest: str
+    messages: tuple[ChatMessage, ...]
+    parameters: dict[str, Any]
+
+
 @dataclass
 class FakeUpstream:
     """A scriptable upstream that records how many calls it received."""
 
     responses: list[FakeResponse] = field(default_factory=list)
     fault: FaultMode = "none"
-    call_count: int = 0
+    calls: list[FakeUpstreamCall] = field(default_factory=list)
     _cursor: int = 0
     #: Seconds to sleep before emitting each streamed block. Zero means the
     #: stream is produced as fast as the caller consumes it.
@@ -54,16 +69,29 @@ class FakeUpstream:
     #: count independently of the scripted answer.
     stream_blocks: int | None = None
 
+    @property
+    def call_count(self) -> int:
+        """How many calls this upstream received, failed ones included."""
+        return len(self.calls)
+
     def queue(self, response: FakeResponse) -> None:
         """Append a response to be returned by the next call."""
         self.responses.append(response)
 
-    def execute(self, request_digest: str) -> FakeResponse:
+    def execute(
+        self,
+        request_digest: str,
+        *,
+        messages: Sequence[ChatMessage] = (),
+        parameters: Mapping[str, Any] | None = None,
+    ) -> FakeResponse:
         """Consume the next scripted response.
 
         Args:
             request_digest: Digest of the request, recorded for assertions that
                 a retry re-sent the same input.
+            messages: The conversation the adapter forwarded.
+            parameters: The parameters the adapter forwarded.
 
         Returns:
             The next response.
@@ -72,7 +100,13 @@ class FakeUpstream:
             RuntimeError: If the script is exhausted, which means the code under
                 test made more upstream calls than intended.
         """
-        self.call_count += 1
+        self.calls.append(
+            FakeUpstreamCall(
+                request_digest=request_digest,
+                messages=tuple(messages),
+                parameters=dict(parameters or {}),
+            )
+        )
         if self.fault == "quota_exhausted":
             raise UpstreamQuotaExceeded("fake upstream quota exhausted")
         if self.fault == "error_before_output":

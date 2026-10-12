@@ -89,13 +89,15 @@
 
 编解码走 `canonical.loads_strict` / `canonical.canonicalize`，因此**网络边界天然拒绝**浮点、重复 key、`NaN`/`Infinity`。未知 `type` 一律拒绝并回 `protocol.error`，不做静默忽略。
 
+`attempt.offer` 携带的是**结构化会话**而不是拼平的 prompt 字符串：`messages[]` 逐条原样转发给 upstream（节点是一次 provider 调用的代理，不改写请求），`parameters` 只包含平台明确支持的已知参数集，其余字段在入口被忽略。因为规范编码拒绝浮点，`temperature`/`top_p`/`presence_penalty`/`frequency_penalty` 以最短可往返的十进制字符串传输，由节点在构造 upstream 请求体时还原为 JSON number；`wire.encode_chat_parameters` 与 `wire.decode_chat_parameters` 是这一对转换的唯一实现。
+
 消息类型：
 
 | 方向 | type | 关键字段 |
 |---|---|---|
 | 节点→中心 | `node.hello` | node_id, device_id, provider_id, adapter{name,model}, policy{share_enabled,max_concurrency,budget} |
 | 中心→节点 | `hello.ack` | server_time, heartbeat_interval_s, resume[]（未终态 attempt 的恢复指令） |
-| 中心→节点 | `attempt.offer` | request_id, attempt_id, epoch, resource_id, model, request_digest, max_milli_credits, deadline_ms, delivery_mode |
+| 中心→节点 | `attempt.offer` | request_id, attempt_id, epoch, resource_id, model, request_digest, max_milli_credits, deadline_ms, delivery_mode, messages[]（原样转发的会话）, parameters（原样转发的已知参数集） |
 | 节点→中心 | `attempt.accept` / `attempt.reject` | request_id, attempt_id, epoch, (reason) |
 | 中心→节点 | `attempt.execute` | request_id, attempt_id, epoch |
 | 中心→节点 | `attempt.cancel` | request_id, attempt_id, epoch, origin |

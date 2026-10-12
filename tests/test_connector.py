@@ -40,10 +40,12 @@ from aipotluck.websocket import (
 from aipotluck.wire import (
     AttemptOffer,
     AttemptRef,
+    ChatMessage,
     Envelope,
     HelloAck,
     ResumeDirective,
     compute_permit_hash,
+    user_message,
 )
 
 #: A fixed instant before every test key is registered, so signature validity
@@ -232,7 +234,8 @@ def make_offer(
     request_digest: str = "sha256:req",
     max_milli_credits: int = 1000,
     authorization_hash: str = "auth-1",
-    prompt: str = "hi",
+    messages: tuple[ChatMessage, ...] = (user_message("hi"),),
+    parameters: dict[str, object] | None = None,
 ) -> AttemptOffer:
     """Build an offer whose `permit_hash` matches its own fields."""
     permit_hash = compute_permit_hash(
@@ -254,7 +257,8 @@ def make_offer(
         max_milli_credits=max_milli_credits,
         deadline_ms=1000,
         delivery_mode="buffered_complete",
-        prompt=prompt,
+        messages=messages,
+        parameters=dict(parameters or {}),
         authorization_hash=authorization_hash,
         permit_hash=permit_hash,
     )
@@ -321,9 +325,15 @@ class GatedAdapter:
     release: threading.Event = field(default_factory=threading.Event)
     calls: int = 0
 
-    def complete(self, prompt: str, *, request_digest: str) -> AdapterResult:
+    def complete(
+        self,
+        messages: object,
+        *,
+        request_digest: str,
+        parameters: object,
+    ) -> AdapterResult:
         """Block until released, then return a completion."""
-        del prompt, request_digest
+        del messages, request_digest, parameters
         self.calls += 1
         self.entered.set()
         self.release.wait(10.0)
@@ -384,7 +394,7 @@ def test_happy_path_over_a_real_socket(center, tmp_path) -> None:
     adapter.upstream.queue(
         FakeResponse(text_chunks=("Hello",), usage=NormalizedUsage(input_total=10, output_total=5))
     )
-    offer = make_offer(prompt="hi")
+    offer = make_offer(messages=(user_message("hi"),))
     observed: dict[str, object] = {}
 
     def script(index: int, link: Link) -> None:
@@ -480,7 +490,7 @@ def test_duplicate_execute_does_not_call_the_adapter_again(center, tmp_path) -> 
     adapter.upstream.queue(
         FakeResponse(text_chunks=("abc",), usage=NormalizedUsage(input_total=3, output_total=4))
     )
-    offer = make_offer(prompt="hi")
+    offer = make_offer(messages=(user_message("hi"),))
     observed: dict[str, object] = {}
 
     def script(index: int, link: Link) -> None:

@@ -18,7 +18,7 @@ import http.client
 import json
 import socket
 import ssl
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
@@ -29,6 +29,7 @@ from aipotluck.tls import client_ssl_context
 from .canonical import loads_strict
 from .fake_upstream import FakeResponse, FakeUpstream, UpstreamError, UpstreamQuotaExceeded
 from .metering import NormalizedUsage, normalize_anthropic_usage, normalize_openai_usage
+from .wire import ChatMessage, decode_chat_parameters
 
 #: Default wall-clock budget for one buffered upstream call.
 DEFAULT_TIMEOUT_S = 60.0
@@ -223,7 +224,14 @@ def iter_sse_events(chunks: Iterable[bytes]) -> Iterator[SSEFrame]:
 
 
 class Adapter(Protocol):
-    """One configured upstream a node may execute against."""
+    """One configured upstream a node may execute against.
+
+    An adapter is a proxy for exactly one provider call: it forwards the
+    conversation and the parameters the center admitted, and reports what the
+    upstream answered. It never rewrites the request, because a node that
+    paraphrased a conversation would be billing one party for work another
+    asked for.
+    """
 
     #: Stable adapter name, advertised in `node.hello`.
     name: str
@@ -241,13 +249,21 @@ class Adapter(Protocol):
         """
         ...
 
-    def complete(self, prompt: str, *, request_digest: str) -> AdapterResult:
+    def complete(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        request_digest: str,
+        parameters: Mapping[str, Any],
+    ) -> AdapterResult:
         """Run one buffered completion.
 
         Args:
-            prompt: The request text.
+            messages: The conversation to run, forwarded verbatim.
             request_digest: Digest of the request, recorded so a test can prove a
                 retry re-sent identical input.
+            parameters: The forwarded parameters, in the wire encoding
+                `decode_chat_parameters` reads.
 
         Returns:
             The completion and its usage.
@@ -263,13 +279,21 @@ class Adapter(Protocol):
         """
         ...
 
-    def stream(self, prompt: str, *, request_digest: str) -> Iterator[StreamChunk]:
+    def stream(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        request_digest: str,
+        parameters: Mapping[str, Any],
+    ) -> Iterator[StreamChunk]:
         """Run one streaming completion, yielding text as the upstream produces it.
 
         Args:
-            prompt: The request text.
+            messages: The conversation to run, forwarded verbatim.
             request_digest: Digest of the request, recorded so a test can prove a
                 retry re-sent identical input.
+            parameters: The forwarded parameters, in the wire encoding
+                `decode_chat_parameters` reads.
 
         Yields:
             `StreamChunk`s in order. The last has `is_final=True` and is the only
@@ -305,12 +329,20 @@ class FakeUpstreamAdapter:
         """The fake upstream can always emit its script incrementally."""
         return True
 
-    def complete(self, prompt: str, *, request_digest: str) -> AdapterResult:
+    def complete(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        request_digest: str,
+        parameters: Mapping[str, Any],
+    ) -> AdapterResult:
         """Return the next scripted response.
 
         Args:
-            prompt: Ignored; the fake upstream answers from its script.
+            messages: Recorded by the fake upstream, which answers from its
+                script rather than from them.
             request_digest: Digest recorded by the fake upstream for assertions.
+            parameters: Recorded alongside the messages.
 
         Returns:
             The scripted completion.
@@ -321,9 +353,10 @@ class FakeUpstreamAdapter:
                 before output. An exhausted script means an extra upstream call
                 was made, which is a bug in the caller rather than the upstream.
         """
-        del prompt
         try:
-            response: FakeResponse = self.upstream.execute(request_digest)
+            response: FakeResponse = self.upstream.execute(
+                request_digest, messages=messages, parameters=parameters
+            )
         except UpstreamQuotaExceeded as exc:
             raise AdapterQuotaExceeded(str(exc)) from exc
         except UpstreamError as exc:
@@ -340,7 +373,13 @@ class FakeUpstreamAdapter:
             upstream_calls=self.upstream.call_count,
         )
 
-    def stream(self, prompt: str, *, request_digest: str) -> Iterator[StreamChunk]:
+    def stream(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        request_digest: str,
+        parameters: Mapping[str, Any],
+    ) -> Iterator[StreamChunk]:
         """Emit the next scripted response one block at a time.
 
         The script is consumed exactly once per call, through the same
@@ -350,8 +389,10 @@ class FakeUpstreamAdapter:
         surfaces as `AdapterError` rather than a short-but-successful answer.
 
         Args:
-            prompt: Ignored; the fake upstream answers from its script.
+            messages: Recorded by the fake upstream, which answers from its
+                script rather than from them.
             request_digest: Digest recorded by the fake upstream for assertions.
+            parameters: Recorded alongside the messages.
 
         Yields:
             The scripted blocks, then one final chunk. The final chunk carries
@@ -362,9 +403,10 @@ class FakeUpstreamAdapter:
             AdapterError: When the script is exhausted, breaks mid-stream, or
                 produces no output at all.
         """
-        del prompt
         try:
-            response: FakeResponse = self.upstream.execute(request_digest)
+            response: FakeResponse = self.upstream.execute(
+                request_digest, messages=messages, parameters=parameters
+            )
         except UpstreamQuotaExceeded as exc:
             raise AdapterQuotaExceeded(str(exc)) from exc
         except UpstreamError as exc:
@@ -448,13 +490,20 @@ class HttpUpstreamAdapter:
             "provider_style": self.provider_style,
         }
 
-    def complete(self, prompt: str, *, request_digest: str) -> AdapterResult:
+    def complete(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        request_digest: str,
+        parameters: Mapping[str, Any],
+    ) -> AdapterResult:
         """Run one buffered completion against the configured endpoint.
 
         Args:
-            prompt: The request text.
+            messages: The conversation, forwarded verbatim.
             request_digest: Digest of the request; recorded only in the request
                 ID header so the upstream can correlate, never in the body.
+            parameters: The forwarded parameters.
 
         Returns:
             The completion and its usage.
@@ -466,7 +515,7 @@ class HttpUpstreamAdapter:
         """
         del request_digest
         parts = self._endpoint_parts()
-        body = self._encode_body(self._request_body(prompt, stream=False))
+        body = self._encode_body(self._request_body(messages, parameters, stream=False))
         headers = self._headers(len(body), streaming=False)
         connection = self._connect(parts)
         try:
@@ -500,7 +549,13 @@ class HttpUpstreamAdapter:
         self._raise_for_status(response.status, parts)
         return self._parse(raw)
 
-    def stream(self, prompt: str, *, request_digest: str) -> Iterator[StreamChunk]:
+    def stream(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        request_digest: str,
+        parameters: Mapping[str, Any],
+    ) -> Iterator[StreamChunk]:
         """Run one streaming completion against the configured endpoint.
 
         The request asks the provider for its native stream (`stream: true`,
@@ -513,9 +568,10 @@ class HttpUpstreamAdapter:
         a short one.
 
         Args:
-            prompt: The request text.
+            messages: The conversation, forwarded verbatim.
             request_digest: Digest of the request; accepted for parity with
                 `complete` and not sent in the body.
+            parameters: The forwarded parameters.
 
         Yields:
             `StreamChunk`s in order; the last has `is_final=True` and carries the
@@ -529,7 +585,7 @@ class HttpUpstreamAdapter:
         """
         del request_digest
         parts = self._endpoint_parts()
-        body = self._encode_body(self._request_body(prompt, stream=True))
+        body = self._encode_body(self._request_body(messages, parameters, stream=True))
         headers = self._headers(len(body), streaming=True)
         connection = self._connect(parts)
         try:
@@ -644,29 +700,52 @@ class HttpUpstreamAdapter:
                 return
             yield block
 
-    def _request_body(self, prompt: str, *, stream: bool) -> dict[str, Any]:
+    def _request_body(
+        self, messages: Sequence[ChatMessage], parameters: Mapping[str, Any], *, stream: bool
+    ) -> dict[str, Any]:
         """Return the provider-shaped request body.
 
+        The conversation arrives verbatim and leaves verbatim; the only reshaping
+        is the one Anthropic's own API demands, where a ``system`` message is a
+        top-level field rather than a turn. The forwarded parameters are merged
+        after the fixed fields, so a parameter the requester named always wins
+        over this adapter's own default — and ``max_tokens`` is therefore only a
+        default for the styles that require one.
+
         Args:
-            prompt: The request text.
+            messages: The conversation to run.
+            parameters: The forwarded parameters, in the wire encoding.
             stream: Whether to ask for the provider's native stream. The OpenAI
                 style additionally requests the terminal usage frame, which is
                 otherwise omitted from streams.
         """
+        forwarded = decode_chat_parameters(parameters)
+        body: dict[str, Any]
         if self.provider_style == "anthropic":
-            return {
+            system = "\n\n".join(
+                str(message.content)
+                for message in messages
+                if message.role == "system" and isinstance(message.content, str)
+            )
+            body = {
                 "model": self.model,
                 "max_tokens": self.max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    message.to_payload() for message in messages if message.role != "system"
+                ],
                 "stream": stream,
             }
-        body: dict[str, Any] = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": stream,
-        }
-        if stream:
-            body["stream_options"] = {"include_usage": True}
+            if system:
+                body["system"] = system
+        else:
+            body = {
+                "model": self.model,
+                "messages": [message.to_payload() for message in messages],
+                "stream": stream,
+            }
+            if stream:
+                body["stream_options"] = {"include_usage": True}
+        body.update(forwarded)
         return body
 
     def _consume_stream(self, frames: Iterable[SSEFrame]) -> Iterator[StreamChunk]:

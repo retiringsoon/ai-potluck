@@ -40,6 +40,49 @@ DeliveryMode = Literal["stream_strict", "buffered_complete"]
 ExecutionState = Literal["SUBMITTING", "SUBMITTED", "FAILED", "UNKNOWN"]
 ExecutionCertainty = Literal["not_submitted", "submitted", "unknown"]
 
+#: Conversation roles a requester may name. This is the role set OpenAI's Chat
+#: Completions API defines; a message whose role is outside it is refused at the
+#: boundary rather than forwarded to an upstream whose rejection the requester
+#: would receive as an opaque failure.
+CHAT_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
+
+#: How many messages one request may carry. A bound rather than a policy: the
+#: offer has to fit inside `MAX_MESSAGE_BYTES`, and a conversation too long for
+#: one envelope is refused at admission instead of being truncated in flight.
+MAX_CHAT_MESSAGES = 512
+
+#: The request parameters a center forwards to the upstream, named exactly as
+#: OpenAI's Chat Completions API names them. Anything else in a request body is
+#: ignored rather than forwarded: the set is what the platform has decided it
+#: will honour, so an upstream-specific field cannot become an undocumented way
+#: to change what a node asks a provider for. ``model``, ``messages``,
+#: ``stream`` and ``stream_options`` are deliberately absent — the first two are
+#: the request itself and the last two are the delivery mode the center chose.
+CHAT_PARAMETER_KEYS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "max_completion_tokens",
+        "stop",
+        "presence_penalty",
+        "frequency_penalty",
+        "seed",
+        "logit_bias",
+        "user",
+        "response_format",
+    }
+)
+
+#: The forwarded parameters whose upstream value is a JSON number that may carry
+#: a fraction. `canonical.canonicalize` refuses floats outright, so these travel
+#: as their shortest round-tripping decimal string and `decode_chat_parameters`
+#: turns them back into the number the upstream expects. Every other parameter
+#: keeps the JSON type it arrived with.
+DECIMAL_CHAT_PARAMETERS = frozenset(
+    {"temperature", "top_p", "presence_penalty", "frequency_penalty"}
+)
+
 MESSAGE_TYPES = frozenset(
     {
         "node.hello",
@@ -404,6 +447,253 @@ class HelloAck:
 
 
 @dataclass(frozen=True)
+class ChatMessage:
+    """One chat message, carried verbatim from the requester to the upstream.
+
+    ``content`` stays whatever the requester sent: a string, the list of typed
+    content parts OpenAI defines for a multimodal message, or `None` for a
+    message that carries tool calls instead of text. Nothing in this layer
+    interprets or reshapes it, and that is the point — a center that flattened a
+    conversation into one prompt string would destroy exactly the multi-turn
+    context the upstream is being asked about, and the requester could not tell
+    from the answer that it had been rewritten.
+
+    Attributes:
+        role: One of `CHAT_ROLES`.
+        content: The requester's own content value.
+    """
+
+    role: str
+    content: str | tuple[Any, ...] | None
+
+    def to_payload(self) -> dict[str, Any]:
+        """Return the canonical payload of this message."""
+        content: Any = self.content
+        if isinstance(content, tuple):
+            content = list(content)
+        return {"role": self.role, "content": content}
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> ChatMessage:
+        """Parse one message of a ``messages`` array.
+
+        Raises:
+            ProtocolError: If the message is not an object, names an unknown or
+                empty role, or carries content that is neither a string, a list
+                of objects, nor null.
+        """
+        if not isinstance(payload, dict):
+            raise ProtocolError(
+                f"a message must be a JSON object, got {type(payload).__name__}"
+            )
+        role = payload.get("role")
+        if not isinstance(role, str) or not role:
+            raise ProtocolError("a message role must be a non-empty string")
+        if role not in CHAT_ROLES:
+            raise ProtocolError(
+                f"unknown message role {role!r}; expected one of {sorted(CHAT_ROLES)}"
+            )
+        if "content" not in payload:
+            raise ProtocolError(f"a {role} message carries no content field")
+        content = payload["content"]
+        if content is None or isinstance(content, str):
+            return cls(role=role, content=content)
+        if isinstance(content, list):
+            parts = tuple(content)
+            for part in parts:
+                if not isinstance(part, dict):
+                    raise ProtocolError(
+                        "a message content part must be a JSON object, got "
+                        f"{type(part).__name__}"
+                    )
+            return cls(role=role, content=parts)
+        raise ProtocolError(
+            "a message content must be a string, a list of content parts, or null"
+        )
+
+
+def parse_chat_messages(raw: Any) -> tuple[ChatMessage, ...]:
+    """Parse a ``messages`` array into the messages one request carries.
+
+    Args:
+        raw: The value a request body or an offer payload held under
+            ``messages``.
+
+    Returns:
+        The parsed messages, in order.
+
+    Raises:
+        ProtocolError: If the value is not a non-empty list, holds a message
+            `ChatMessage.from_payload` refuses, or exceeds `MAX_CHAT_MESSAGES`.
+    """
+    if not isinstance(raw, list):
+        raise ProtocolError(
+            f"messages must be a JSON array, got {type(raw).__name__}"
+        )
+    if not raw:
+        raise ProtocolError("messages must carry at least one message")
+    if len(raw) > MAX_CHAT_MESSAGES:
+        raise ProtocolError(
+            f"messages carries {len(raw)} messages, above the {MAX_CHAT_MESSAGES} "
+            "limit; the request cannot be offered to a node as one envelope"
+        )
+    return tuple(ChatMessage.from_payload(item) for item in raw)
+
+
+def user_message(text: str) -> ChatMessage:
+    """Return the single-turn message a plain question becomes."""
+    return ChatMessage(role="user", content=text)
+
+
+def encode_chat_parameters(raw: Any) -> dict[str, Any]:
+    """Reduce a request body's parameters to the set the platform forwards.
+
+    Called once, at the boundary where an OpenAI-shaped body enters the platform.
+    Keys outside `CHAT_PARAMETER_KEYS` are dropped rather than forwarded, an
+    explicit ``null`` is dropped rather than sent (a parameter the requester has
+    no opinion about must not override the upstream's own default), and the
+    fractional parameters `DECIMAL_CHAT_PARAMETERS` names become their shortest
+    round-tripping decimal string so the canonical encoder — which refuses floats
+    by design — can carry them through the store, the digest and the offer.
+
+    Args:
+        raw: The parameters of a request body; anything not a mapping yields no
+            parameters at all.
+
+    Returns:
+        The forwarded parameters, canonical-safe and ordered by key.
+
+    Raises:
+        ProtocolError: If a forwarded parameter has a value of the wrong shape,
+            or a fraction that is not finite.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    encoded: dict[str, Any] = {}
+    for key in sorted(CHAT_PARAMETER_KEYS):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if value is None:
+            continue
+        encoded[key] = _encode_parameter(key, value)
+    return encoded
+
+
+def _encode_parameter(key: str, value: Any) -> Any:
+    """Return one parameter value in the canonical-safe encoding.
+
+    Raises:
+        ProtocolError: If the value has the wrong type for `key`.
+    """
+    if key in DECIMAL_CHAT_PARAMETERS:
+        if isinstance(value, bool):
+            raise ProtocolError(f"{key} must be a number")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if value != value or value in (float("inf"), float("-inf")):
+                raise ProtocolError(f"{key} must be a finite number")
+            # `repr` of a float is the shortest decimal string that reads back
+            # as the same double, so the round trip through the canonical
+            # encoder loses nothing.
+            return repr(value)
+        raise ProtocolError(f"{key} must be a number")
+    if key in ("max_tokens", "max_completion_tokens", "seed"):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ProtocolError(f"{key} must be an integer")
+        if value < 0:
+            raise ProtocolError(f"{key} must be non-negative")
+        return value
+    if key == "stop":
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            for item in value:
+                if not isinstance(item, str):
+                    raise ProtocolError("stop must be a string or a list of strings")
+            return list(value)
+        raise ProtocolError("stop must be a string or a list of strings")
+    if key == "logit_bias":
+        if not isinstance(value, dict):
+            raise ProtocolError("logit_bias must be an object")
+        for token, bias in value.items():
+            if not isinstance(token, str) or isinstance(bias, bool) or not isinstance(bias, int):
+                raise ProtocolError("logit_bias must map a token string to an integer")
+        return dict(value)
+    if key == "response_format":
+        if not isinstance(value, dict):
+            raise ProtocolError("response_format must be an object")
+        return dict(value)
+    if not isinstance(value, str):
+        raise ProtocolError(f"{key} must be a string")
+    return value
+
+
+def decode_chat_parameters(values: Any) -> dict[str, Any]:
+    """Turn forwarded parameters back into the body an upstream expects.
+
+    The inverse of `encode_chat_parameters`: the fractional parameters arrive as
+    decimal strings, because that is the only form the canonical wire encoding
+    carries, and an upstream that received ``"temperature": "0.7"`` would reject
+    a request the platform accepted. Every other value keeps the type it was
+    forwarded with.
+
+    Args:
+        values: The parameters an offer carried.
+
+    Returns:
+        The parameters as an upstream request body names them.
+    """
+    if not isinstance(values, dict):
+        return {}
+    decoded: dict[str, Any] = {}
+    for key, value in values.items():
+        if key in DECIMAL_CHAT_PARAMETERS and isinstance(value, str):
+            decoded[key] = float(value)
+        else:
+            decoded[key] = value
+    return decoded
+
+
+def compute_request_digest(
+    *,
+    messages: tuple[ChatMessage, ...],
+    model: str,
+    delivery_mode: str,
+    parameters: Any = None,
+) -> str:
+    """Return the digest of the immutable work one request asks for.
+
+    This is the single definition of a request's identity as work: the
+    authorization a consumer signs names it, admission re-derives it from what
+    was actually submitted and refuses a mismatch, and the offer a node accepts
+    carries it into the permit hash and the signed usage report. Covering the
+    messages *and* the forwarded parameters is what stops an authorization for
+    one conversation from being re-pointed at another, or a ceiling signed for a
+    64-token answer from being spent on a 4096-token one.
+
+    Args:
+        messages: The conversation, in order.
+        model: The model requested.
+        delivery_mode: The delivery mode admitted.
+        parameters: The forwarded parameters in their canonical-safe encoding;
+            `None` or a non-mapping means the request named none.
+
+    Returns:
+        The canonical digest.
+    """
+    return canonical_digest(
+        {
+            "messages": [message.to_payload() for message in messages],
+            "model": model,
+            "delivery_mode": delivery_mode,
+            "parameters": dict(parameters) if isinstance(parameters, dict) else {},
+        }
+    )
+
+
+@dataclass(frozen=True)
 class AttemptOffer:
     """Center's proposal of one attempt to one node.
 
@@ -411,6 +701,9 @@ class AttemptOffer:
     echoes it inside its signed usage report, so a report cannot be replayed onto
     a different attempt or a different budget: the center recomputes the digest
     from what it actually offered and refuses a mismatch.
+
+    `messages` and `parameters` are the work itself, forwarded to the upstream
+    unchanged: the node is a proxy for one provider call, not an author.
     """
 
     request_id: str
@@ -422,7 +715,8 @@ class AttemptOffer:
     max_milli_credits: int
     deadline_ms: int
     delivery_mode: DeliveryMode
-    prompt: str
+    messages: tuple[ChatMessage, ...]
+    parameters: dict[str, Any]
     authorization_hash: str
     permit_hash: str
 
@@ -438,7 +732,8 @@ class AttemptOffer:
             "max_milli_credits": self.max_milli_credits,
             "deadline_ms": self.deadline_ms,
             "delivery_mode": self.delivery_mode,
-            "prompt": self.prompt,
+            "messages": [message.to_payload() for message in self.messages],
+            "parameters": dict(self.parameters),
             "authorization_hash": self.authorization_hash,
             "permit_hash": self.permit_hash,
         }
@@ -448,11 +743,15 @@ class AttemptOffer:
         """Parse an `attempt.offer` payload.
 
         Raises:
-            ProtocolError: If a field is missing or the delivery mode is unknown.
+            ProtocolError: If a field is missing, the delivery mode is unknown,
+                or the messages are not a conversation this platform forwards.
         """
         mode = payload.get("delivery_mode")
         if mode not in ("stream_strict", "buffered_complete"):
             raise ProtocolError(f"unknown delivery_mode {mode!r}")
+        parameters = payload.get("parameters", {})
+        if not isinstance(parameters, dict):
+            raise ProtocolError("parameters must be a JSON object")
         return cls(
             request_id=_require_str(payload, "request_id"),
             attempt_id=_require_str(payload, "attempt_id"),
@@ -463,7 +762,8 @@ class AttemptOffer:
             max_milli_credits=_require_int(payload, "max_milli_credits"),
             deadline_ms=_require_int(payload, "deadline_ms", minimum=1),
             delivery_mode=cast("DeliveryMode", mode),
-            prompt=_require_str(payload, "prompt"),
+            messages=parse_chat_messages(payload.get("messages")),
+            parameters=dict(parameters),
             authorization_hash=_require_str(payload, "authorization_hash"),
             permit_hash=_require_str(payload, "permit_hash"),
         )
