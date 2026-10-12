@@ -110,7 +110,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Final, Protocol
+from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
 from aipotluck.tls import client_ssl_context
@@ -1883,13 +1883,6 @@ class WaitDeadline(PotluckError):
     """
 
 
-#: The terminal states whose ``billing_note`` ``ask`` surfaces. A succeeded
-#: request has nothing to explain, and a cancelled one was stopped by the user
-#: who is reading the screen, so only the two states that mean "the platform
-#: could not finish this" carry a reason worth printing.
-_FAILED_REQUEST_STATES: Final[frozenset[str]] = frozenset({"FAILED", "EXPIRED"})
-
-
 def _print_billing_note(document: dict[str, Any]) -> None:
     """Print the center's own one-line reason for a request that did not succeed.
 
@@ -2532,13 +2525,20 @@ def run_streaming_answer(
     return status, cancel_event.is_set(), answer_parts
 
 
-def _report_ask_failure(directory: Path, exc: PotluckError) -> int:
+def _report_ask_failure(
+    directory: Path, exc: PotluckError, *, status_document: dict[str, Any] | None = None
+) -> int:
     """Record one ``ask`` failure and print it with its classified next step.
 
     Shared by every path that ends an ``ask`` in a handled error, so the message
     a user reads does not depend on which step happened to fail. Returns the
     exit status rather than raising: ``ask`` reports and exits 1, it does not
     propagate.
+
+    ``status_document`` is the request as the center sees it, when the caller
+    could read one back. Its note is printed between the local error and the next
+    step because the two are different facts: the error says how this wait ended,
+    the note says why the center had not finished.
     """
     guidance = ux.classify_failure(
         error_code=getattr(exc, "error_code", None),
@@ -2547,6 +2547,8 @@ def _report_ask_failure(directory: Path, exc: PotluckError) -> int:
     )
     _record_error(directory, guidance)
     print(f"{PROG}: error: {exc}", file=sys.stderr)
+    if status_document is not None:
+        _print_billing_note(status_document)
     print(f"{PROG}: {guidance.next_step}", file=sys.stderr)
     return 1
 
@@ -2681,6 +2683,18 @@ def _cmd_ask(args: argparse.Namespace) -> int:
             _print_billing_note(client.get(f"/v1/requests/{request_id}"))
         print(f"{PROG}: {ux.NO_NODES_NEXT_STEP}", file=sys.stderr)
         return 1
+    except WaitDeadline as exc:
+        # The local wait closed; the work did not. The center may still be holding
+        # the request in its dispatch queue or running it on a node, so nothing is
+        # cancelled here and `--resume` stays available. What the user is owed
+        # beyond the local explanation is the center's own reason for not having
+        # finished, which for a queued request is the note naming the node that
+        # declined and why — without it a wait that ends is indistinguishable from
+        # a center that said nothing.
+        unfinished: dict[str, Any] | None = None
+        with contextlib.suppress(PotluckError):
+            unfinished = client.get(f"/v1/requests/{request_id}")
+        return _report_ask_failure(directory, exc, status_document=unfinished)
     except PotluckError as exc:
         return _report_ask_failure(directory, exc)
     finally:
@@ -2695,7 +2709,12 @@ def _cmd_ask(args: argparse.Namespace) -> int:
     if final_status in TERMINAL_REQUEST_STATES:
         with contextlib.suppress(OSError):
             pending_path.unlink()
-    if final_status in _FAILED_REQUEST_STATES:
+    # Any request that did not succeed, not only a terminal one. A center that
+    # holds a dispatch queue leaves a request it could not place waiting rather
+    # than ending it, and the reason it is waiting — which node declined, on what
+    # local policy — is on that request's note. Printing the note only for FAILED
+    # and EXPIRED would swallow exactly the explanation a wait ends without.
+    if final_status != "SUCCEEDED":
         _print_billing_note(document)
     if cancelled:
         print(
