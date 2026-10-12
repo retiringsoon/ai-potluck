@@ -22,6 +22,17 @@ Reconciliation (read-only; nothing is written and no account is frozen):
   center says it dispatched here, and names every attempt the two sides
   disagree about.
 
+Contributor configuration (nothing is uploaded; an upstream key stays here):
+
+* ``contribute import-config`` reads the upstream endpoint, model and API key out
+  of a configuration that already exists on this machine — Claude Code's
+  ``settings.json``, Codex's ``config.toml``, or the ``OPENAI_*``/``ANTHROPIC_*``
+  environment — and writes them into ``node.json``'s adapter block, so a
+  credential is not retyped into a second place where it can go stale. A field the
+  source does not name is reported by the key path it was looked for, together
+  with the argument that would supply it, and an incomplete import writes
+  nothing. See :mod:`aipotluck.configimport`.
+
 Network operations (wired through :mod:`aipotluck.deploy`):
 
 * ``connect`` runs a contribution node from ``node.json``, probing the
@@ -50,6 +61,18 @@ Onboarding and consumer commands (the invite flow):
   (the display is a replaceable function so a streaming worker can make it
   incremental).
 * ``version`` prints the package and protocol versions.
+* ``serve-openai`` runs a loopback-only HTTP endpoint that speaks the shapes
+  tools already use — OpenAI's ``POST /v1/chat/completions`` and ``GET
+  /v1/models``, and Anthropic's ``POST /v1/messages``, which is what Claude Code
+  speaks — and turns each request into one on the same signed consumer path
+  ``ask`` uses, so a tool needs a ``base_url`` and no potluck-specific code. The
+  endpoint lives in :mod:`aipotluck.localapi` and the tool-facing wire shapes in
+  :mod:`aipotluck.openai_wire`.
+* ``config emit`` prints the configuration block that points a tool at that
+  endpoint — ``--shell`` for an OpenAI-compatible client, whose base URL carries
+  ``/v1``, and ``--claude-code`` for Claude Code's ``settings.json`` env block,
+  whose base URL must not, because Claude Code appends ``/v1/messages`` itself.
+  See :mod:`aipotluck.configemit`.
 
 The payload is parsed with :func:`aipotluck.canonical.loads_strict` on both the
 signing and verification path. That is deliberate: a payload the signer would
@@ -85,14 +108,14 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final, Protocol
 from urllib.parse import quote, urlsplit
 
 from aipotluck.tls import client_ssl_context
 
-from . import canonical, identity, ux
+from . import canonical, configimport, identity, ux
 from .adapters import HttpUpstreamAdapter, probe_endpoint
 from .canonical import canonicalize
 from .connector import Connector
@@ -105,6 +128,7 @@ from .deploy import (
     consumer_get,
     consumer_post,
     load_consumer,
+    load_document,
     load_node,
     poll_request_until_terminal,
     redacted_node,
@@ -122,7 +146,7 @@ from .reconcile import (
 )
 from .records import SpendAuthorization, new_nonce
 from .statemachine import TERMINAL_REQUEST_STATES
-from .wire import compute_request_digest, user_message
+from .wire import ChatMessage, compute_request_digest, user_message
 
 PROG = "potluck"
 
@@ -223,12 +247,18 @@ EXIT_CANCELLED = 130
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the argument parser with the ``keygen``, ``sign`` and ``verify`` subcommands.
+    """Build the argument parser with one subparser per command.
 
     Returns:
         The fully configured parser. Each subparser records its handler via
         ``set_defaults`` so dispatch needs no separate table.
     """
+    # Function-local, as every import of :mod:`aipotluck.localapi` in this module
+    # is: that module drives the consumer seams defined here, so the dependency
+    # runs one way and a module-level import would be a cycle. Its constants are
+    # read here rather than restated, so a default can be written down once.
+    from . import localapi
+
     parser = argparse.ArgumentParser(
         prog=PROG,
         description=(
@@ -572,6 +602,81 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ask.set_defaults(handler=_cmd_ask)
 
+    serve_openai = subparsers.add_parser(
+        "serve-openai",
+        help="Serve this machine's identity to local tools as an OpenAI/Anthropic endpoint.",
+        description=(
+            "Run a loopback HTTP endpoint that accepts the request shapes tools "
+            "already speak — OpenAI's POST /v1/chat/completions and GET "
+            "/v1/models, and Anthropic's POST /v1/messages, which is what Claude "
+            "Code speaks — and turns each one into a request on this machine's own "
+            "signed consumer path, exactly as `ask` does. Buffered and streaming "
+            "answers are both served, and a request that does not reach SUCCEEDED "
+            "is answered as an error naming the platform's request id and the way "
+            "to check what it cost.\n\n"
+            "The endpoint binds an IPv4 loopback address and refuses to start on "
+            "anything else, and it checks no API key: any process able to open a "
+            "loopback port could equally run `ask` against the same key file, so "
+            "loopback reachability *is* the threat model rather than a key check "
+            "that would add a prompt and no boundary. What loopback binding does "
+            "buy is the property that matters: the signing key never leaves this "
+            "machine, which is the difference from the center's own "
+            "OpenAI-compatible surface at <center-url>/openai/v1, where the center "
+            "holds bounded spending authority over a key it issued.\n\n"
+            f"Point a tool at it with `{PROG} config emit --shell` or "
+            f"`{PROG} config emit --claude-code`."
+        ),
+    )
+    _add_config_dir_argument(serve_openai)
+    serve_openai.add_argument(
+        "--host",
+        default=localapi.LOOPBACK_HOST,
+        help=(
+            "Address to bind. An IPv4 loopback address only; 0.0.0.0, ::, a "
+            "public address and a hostname are all refused, because an endpoint "
+            "that spends this identity must not be reachable from another "
+            f"machine (default {localapi.LOOPBACK_HOST})."
+        ),
+    )
+    serve_openai.add_argument(
+        "--port",
+        type=int,
+        default=localapi.DEFAULT_PORT,
+        help=f"Port to listen on (default {localapi.DEFAULT_PORT}).",
+    )
+    serve_openai.add_argument(
+        "--max-charge",
+        type=int,
+        default=ASK_DEFAULT_MAX_CHARGE,
+        dest="max_charge",
+        metavar="MILLI_CREDITS",
+        help=(
+            "Charge ceiling signed into every authorization this endpoint mints "
+            f"(default {ASK_DEFAULT_MAX_CHARGE})."
+        ),
+    )
+    serve_openai.add_argument(
+        "--timeout",
+        type=float,
+        default=ASK_DEFAULT_TIMEOUT_S,
+        help=(
+            "Seconds one request waits for a terminal status "
+            f"(default {ASK_DEFAULT_TIMEOUT_S:g})."
+        ),
+    )
+    serve_openai.add_argument(
+        "--no-node-grace",
+        type=float,
+        default=ASK_NO_NODE_GRACE_S,
+        dest="no_node_grace",
+        metavar="SECONDS",
+        help=(
+            "How long an empty node list is tolerated before a request is "
+            f"reported as unroutable (default {ASK_NO_NODE_GRACE_S:g})."
+        ),
+    )
+    serve_openai.set_defaults(handler=_cmd_serve_openai)
+
     doctor = subparsers.add_parser(
         "doctor",
         help="Export a redacted diagnostic report for this machine.",
@@ -726,6 +831,167 @@ def _build_parser() -> argparse.ArgumentParser:
                                  help="Print the differences as one canonical JSON document.")
     share_reconcile.set_defaults(handler=_cmd_share_reconcile)
 
+    contribute = subparsers.add_parser(
+        "contribute",
+        help="Configure what this machine shares with the pool.",
+        description=(
+            "The contributor's configuration side of the platform, for the steps "
+            "that are not the interactive wizard. `import-config` reads the "
+            "upstream a tool on this machine is already configured with and "
+            "writes it into node.json, so a credential is not retyped into a "
+            "second place where it can go stale."
+        ),
+    )
+    contribute_sub = contribute.add_subparsers(
+        dest="contribute_command", required=True
+    )
+
+    import_config = contribute_sub.add_parser(
+        "import-config",
+        help="Write the upstream a tool on this machine already uses into node.json.",
+        description=(
+            "Read an upstream endpoint, model and API key out of a configuration "
+            "that already exists on this machine, and write them into the local "
+            "node configuration (mode 0600). One source is named per run:\n\n"
+            "  --from-claude-code  Claude Code's settings.json, whose env block "
+            "names ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY, "
+            "and ANTHROPIC_MODEL. The upstream is read as Anthropic-shaped.\n"
+            "  --from-codex        Codex's config.toml, whose model, "
+            "model_provider and model_providers.<name>.base_url/env_key name the "
+            "same three things. The credential is read from the environment "
+            "variable env_key names, which is where Codex reads it.\n"
+            "  --from-env          The OPENAI_* variables, or the ANTHROPIC_* "
+            "ones; the family that is set decides the wire style.\n\n"
+            "A tool names a base URL and this node's adapter POSTs to exactly the "
+            "URL it is given, so the completion path is completed here. A field "
+            "the source does not name is reported by the key path it was looked "
+            "for, together with every other missing field of that source and the "
+            "argument that would supply it; --upstream-endpoint, "
+            "--upstream-model and --upstream-key-file fill a gap without editing "
+            "another program's file. An incomplete import writes nothing.\n\n"
+            "An existing node.json keeps its token, device binding, limits and "
+            "share switch — only its adapter block is replaced. With no node.json "
+            "yet, one is created from the identity `join --node` saved, which "
+            "needs the platform node token the invite path already stored. The "
+            "upstream key is never printed and never leaves this machine."
+        ),
+    )
+    source = import_config.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--from-claude-code",
+        nargs="?",
+        const=str(configimport.CLAUDE_CODE_SETTINGS),
+        default=None,
+        dest="from_claude_code",
+        metavar="PATH",
+        help=(
+            "Import from Claude Code's settings.json (default "
+            f"{configimport.CLAUDE_CODE_SETTINGS})."
+        ),
+    )
+    source.add_argument(
+        "--from-codex",
+        nargs="?",
+        const=str(configimport.CODEX_CONFIG),
+        default=None,
+        dest="from_codex",
+        metavar="PATH",
+        help=(
+            f"Import from Codex's config.toml (default "
+            f"{configimport.CODEX_CONFIG})."
+        ),
+    )
+    source.add_argument(
+        "--from-env",
+        action="store_true",
+        dest="from_env",
+        help=(
+            "Import from the environment: OPENAI_BASE_URL/OPENAI_API_KEY/"
+            "OPENAI_MODEL, or ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN/"
+            "ANTHROPIC_MODEL."
+        ),
+    )
+    _add_upstream_arguments(import_config, style_default=None)
+    _add_node_token_argument(import_config)
+    _add_config_dir_argument(import_config)
+    import_config.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="node.json to write (default <config-dir>/node.json).",
+    )
+    import_config.set_defaults(handler=_cmd_contribute_import_config)
+
+    config = subparsers.add_parser(
+        "config",
+        help="Emit the configuration the tools on this machine need.",
+        description=(
+            "The consumer's configuration side of the platform: `emit` prints the "
+            "block that points a tool at the loopback endpoint "
+            "`potluck serve-openai` runs, so the base URL is not assembled by "
+            "hand. Nothing is written and no credential is read."
+        ),
+    )
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+
+    emit = config_sub.add_parser(
+        "emit",
+        help="Print the configuration that points a tool at the local endpoint.",
+        description=(
+            "Print a ready-to-paste configuration block for the loopback endpoint, "
+            "on stdout, with the guidance on stderr so the block can be piped into "
+            "a merge without the guidance landing inside a settings file.\n\n"
+            "  --shell        `export` lines for an OpenAI-compatible tool: "
+            "OPENAI_BASE_URL carries /v1, because such a client appends "
+            "chat/completions to whatever it is given.\n"
+            "  --claude-code  the env block of Claude Code's settings.json: "
+            "ANTHROPIC_BASE_URL is the endpoint's root, because Claude Code "
+            "appends /v1/messages itself, which the endpoint serves.\n\n"
+            "The api_key both emit is a documented placeholder, not a credential: "
+            "the endpoint checks no key and signs each request with this machine's "
+            "joined identity instead. Pass --model to name the model a tool should "
+            "ask for; without it a tool sends its own default name, which the pool "
+            "may not serve, and the guidance says so."
+        ),
+    )
+    shape = emit.add_mutually_exclusive_group(required=True)
+    shape.add_argument(
+        "--shell",
+        action="store_true",
+        help="Print `export` lines for an OpenAI-compatible tool.",
+    )
+    shape.add_argument(
+        "--claude-code",
+        action="store_true",
+        dest="claude_code",
+        help="Print the env block of Claude Code's settings.json as one JSON document.",
+    )
+    emit.add_argument(
+        "--host",
+        default=localapi.LOOPBACK_HOST,
+        help=(
+            "The endpoint's address, which must be the IPv4 loopback address it "
+            f"binds (default {localapi.LOOPBACK_HOST})."
+        ),
+    )
+    emit.add_argument(
+        "--port",
+        type=int,
+        default=localapi.DEFAULT_PORT,
+        help=f"The endpoint's port (default {localapi.DEFAULT_PORT}).",
+    )
+    emit.add_argument(
+        "--model",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Model a tool should ask for; it must be one the pool's nodes "
+            "advertise, which `curl -s <base_url>/models` lists."
+        ),
+    )
+    emit.set_defaults(handler=_cmd_config_emit)
+
     return parser
 
 
@@ -741,14 +1007,24 @@ def _add_config_dir_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_share_wizard_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add the contributor wizard's non-secret inputs.
+def _add_upstream_arguments(
+    parser: argparse.ArgumentParser, *, style_default: str | None
+) -> None:
+    """Add the arguments that name an upstream.
 
-    The two secrets — the upstream API key and the platform node token — are
-    deliberately *not* accepted as their own flags. A value passed on a command
-    line is visible to every process on the host through ``ps`` and is kept in
-    the shell's history, so both are read from a file path or an environment
+    The upstream API key is deliberately *not* accepted as a value: a secret on a
+    command line is visible to every process on the host through ``ps`` and is
+    kept in the shell's history, so it is read from a file path or an environment
     variable instead, or prompted for on a terminal.
+
+    Args:
+        parser: The subparser to add to.
+        style_default: The default wire style, or `None` to omit ``--upstream-style``
+            entirely. Omitted for a command whose source decides the style: an
+            imported Claude Code configuration is Anthropic-shaped and an imported
+            Codex one is OpenAI-shaped, and an override there would let an operator
+            configure a node that posts one provider's body at the other's
+            endpoint — a failure that surfaces at the upstream, not here.
     """
     parser.add_argument(
         "--upstream-endpoint",
@@ -768,13 +1044,14 @@ def _add_share_wizard_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="MODEL",
         help="Model this node executes (e.g. gpt-4o-mini).",
     )
-    parser.add_argument(
-        "--upstream-style",
-        default="openai",
-        choices=["openai", "anthropic"],
-        dest="upstream_style",
-        help="Wire style of the upstream (default openai).",
-    )
+    if style_default is not None:
+        parser.add_argument(
+            "--upstream-style",
+            default=style_default,
+            choices=["openai", "anthropic"],
+            dest="upstream_style",
+            help=f"Wire style of the upstream (default {style_default}).",
+        )
     parser.add_argument(
         "--upstream-name",
         default="main",
@@ -792,6 +1069,15 @@ def _add_share_wizard_arguments(parser: argparse.ArgumentParser) -> None:
             f"Alternatively set {UPSTREAM_KEY_ENV}."
         ),
     )
+
+
+def _add_node_token_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the platform node-token override the node-writing commands accept.
+
+    A file path or an environment variable rather than a value, for the same
+    reason as the upstream key: a token on a command line is readable by every
+    process on the host and is kept in the shell's history.
+    """
     parser.add_argument(
         "--node-token-file",
         type=Path,
@@ -805,6 +1091,19 @@ def _add_share_wizard_arguments(parser: argparse.ArgumentParser) -> None:
             "neither."
         ),
     )
+
+
+def _add_share_wizard_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the contributor wizard's non-secret inputs.
+
+    The two secrets — the upstream API key and the platform node token — are
+    deliberately *not* accepted as their own flags. A value passed on a command
+    line is visible to every process on the host through ``ps`` and is kept in
+    the shell's history, so both are read from a file path or an environment
+    variable instead, or prompted for on a terminal.
+    """
+    _add_upstream_arguments(parser, style_default="openai")
+    _add_node_token_argument(parser)
     parser.add_argument(
         "--probe-upstream-live",
         action="store_true",
@@ -1398,7 +1697,7 @@ def _cmd_join(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
-def _load_joined_identity(directory: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def load_joined_identity(directory: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load the saved identity's config and key documents.
 
     Raises:
@@ -1422,6 +1721,23 @@ def _load_joined_identity(directory: Path) -> tuple[dict[str, Any], dict[str, An
     return config_document, _read_identity_key_file(key_path)
 
 
+def signed_client_for(
+    config_document: dict[str, Any], key_document: dict[str, Any]
+) -> SignedClient:
+    """Build a `SignedClient` from a saved identity's two documents.
+
+    One construction site for the signed consumer, shared by ``ask``,
+    ``doctor``, ``verify receipt`` and :mod:`aipotluck.localapi`: the fields an
+    identity carries are read in exactly one place, so a change to what a join
+    saves cannot leave one caller authenticating differently from the others.
+    """
+    return SignedClient(
+        center_url=str(config_document["center_url"]),
+        key_id=str(config_document["key_id"]),
+        private_key_b64=str(key_document["private_key_b64"]),
+    )
+
+
 def _signed_record_document(record: Any) -> dict[str, Any]:
     """Render a signed record as the JSON object a client POSTs."""
     return {
@@ -1437,12 +1753,13 @@ def _signed_record_document(record: Any) -> dict[str, Any]:
     }
 
 
-def _build_ask_request(
+def build_signed_request(
     *,
     config_document: dict[str, Any],
     key_document: dict[str, Any],
-    question: str,
+    messages: tuple[ChatMessage, ...],
     model: str,
+    parameters: Mapping[str, Any],
     max_charge: int,
     delivery_mode: str,
     deadline_ms: int = 60_000,
@@ -1450,11 +1767,33 @@ def _build_ask_request(
     """Build a signed authorization and the request body the center expects.
 
     The `request_digest` is computed by `compute_request_digest` from the exact
-    ``messages``/``model``/``delivery_mode`` submitted, which the center
-    re-derives at admission; a mismatch is refused, so the two must be built from
-    the same values. That is also why ``delivery_mode`` is a parameter rather
-    than a constant: the signature has to cover the mode the body actually asks
-    for.
+    ``messages``/``model``/``delivery_mode``/``parameters`` submitted, which the
+    center re-derives at admission; a mismatch is refused, so the two must be
+    built from the same values. That is also why ``delivery_mode`` is a parameter
+    rather than a constant: the signature has to cover the mode the body actually
+    asks for.
+
+    This is the one place a consumer request is minted, and both consumers of it
+    — ``ask``, which builds one user turn from a question, and
+    :mod:`aipotluck.localapi`, which forwards a tool's own conversation — drive
+    the same signature, submission and wait. A second copy is how the two paths
+    would drift apart about what a request costs.
+
+    Args:
+        config_document: The identity config a ``join`` saved.
+        key_document: The identity key file; only its private key is read.
+        messages: The conversation, forwarded to a contribution node verbatim.
+        model: The model requested; the authorization is scoped to it alone.
+        parameters: The forwarded parameters, in the canonical-safe encoding
+            :func:`aipotluck.wire.encode_chat_parameters` produces. They are
+            part of the digest, so a ceiling signed for one parameter set cannot
+            be spent on another.
+        max_charge: The charge ceiling in milli-credits.
+        delivery_mode: The delivery mode the body asks for.
+        deadline_ms: The center-side deadline the body carries.
+
+    Returns:
+        The minted request id, and the body to POST to ``/v1/requests``.
     """
     request_id = "req-" + secrets.token_hex(16)
     now = dt.datetime.now(dt.UTC)
@@ -1462,11 +1801,11 @@ def _build_ask_request(
     # The signing key id is the one the *server* derived at join; the local key
     # file no longer chooses it, so it is read from the saved config.
     key_id = str(config_document["key_id"])
-    # One question is one user turn: the request model the center and the node
-    # speak is a conversation, never a flattened prompt string.
-    messages = (user_message(question),)
     request_digest = compute_request_digest(
-        messages=messages, model=model, delivery_mode=delivery_mode
+        messages=messages,
+        model=model,
+        delivery_mode=delivery_mode,
+        parameters=parameters,
     )
     authorization = SpendAuthorization(
         authorization_id=f"auth-{request_id}",
@@ -1495,6 +1834,7 @@ def _build_ask_request(
         "idempotency_key": "idem-" + secrets.token_hex(16),
         "messages": [message.to_payload() for message in messages],
         "model": model,
+        "parameters": dict(parameters),
         "delivery_mode": delivery_mode,
         "max_attempts": 2,
         "deadline_ms": deadline_ms,
@@ -1510,6 +1850,20 @@ class NoAvailableNodes(PotluckError):
     A distinct type rather than a message match: ``ask`` reacts to this by
     cancelling the request it already submitted, which it must not do for a
     plain timeout (the work may still be progressing).
+    """
+
+
+class WaitDeadline(PotluckError):
+    """Raised when a wait window closed while the request was still unfinished.
+
+    A distinct type rather than a message match, for the same reason as
+    `NoAvailableNodes`: a deadline is not a refusal. The work may still be
+    running at the center and may still be billed, so
+    :mod:`aipotluck.localapi` answers it as ``504 deadline_passed`` with the
+    billing-honest message, while a center refusal is answered with the code the
+    center itself named. Telling those apart by parsing a message is how a
+    request that may still cost something comes to be reported as a failure of
+    the platform.
     """
 
 
@@ -1640,7 +1994,8 @@ def _await_terminal(
 
     Raises:
         NoAvailableNodes: If no node advertised the model for the whole grace.
-        PotluckError: If the deadline passed, or the user cancelled.
+        WaitDeadline: If the wait window closed with the request unfinished.
+        PotluckError: If the user cancelled, or a read of the center failed.
     """
     deadline = time.monotonic() + timeout_s
     empty_since: float | None = None
@@ -1663,7 +2018,7 @@ def _await_terminal(
                 f"can run model {model!r})"
             )
         if now >= deadline:
-            raise PotluckError(
+            raise WaitDeadline(
                 f"request {request_id} did not reach a terminal state within "
                 f"{timeout_s:g}s; last status {document.get('status')!r}"
             )
@@ -1745,14 +2100,15 @@ def _cost_line(client: SignedClient, document: dict[str, Any], subject_id: str) 
     )
 
 
-class _AskPresenter(Protocol):
-    """The single seam an ``ask`` answer is rendered through.
+class AnswerPresenter(Protocol):
+    """The single seam an answer is rendered through.
 
-    Two implementations exist (a terminal one and a JSON one), and both the
-    streaming and the buffered consumer drive the same three calls. That is
+    ``ask`` has two implementations (a terminal one and a JSON one) and
+    :mod:`aipotluck.localapi` has two more (one that collects an answer into a
+    tool's document, one that writes each increment to a tool's stream). All four
+    are driven by the same three calls from the same two wait loops. That is
     deliberate: the network loop must not contain ``print`` calls, or the next
-    change to the display becomes a change to the code that talks to the
-    network.
+    change to the display becomes a change to the code that talks to the network.
     """
 
     def status(self, text: str) -> None:
@@ -1834,12 +2190,12 @@ class _JsonPresenter:
         )
 
 
-def _presenter_for(*, json_mode: bool) -> _AskPresenter:
+def _presenter_for(*, json_mode: bool) -> AnswerPresenter:
     """Return the presenter matching the requested output format."""
     return _JsonPresenter() if json_mode else _TextPresenter()
 
 
-def _post_cancel(client: SignedClient, request_id: str) -> bool:
+def post_cancel(client: SignedClient, request_id: str) -> bool:
     """Ask the center to cancel a request, returning whether it took.
 
     Cancellation is a real end-to-end action, not a local exit: the center marks
@@ -1928,10 +2284,10 @@ def _record_error(directory: Path, guidance: ux.FailureGuidance) -> None:
         )
 
 
-def _run_ask_buffered(
+def run_buffered_answer(
     client: SignedClient,
     request_id: str,
-    presenter: _AskPresenter,
+    presenter: AnswerPresenter,
     *,
     model: str,
     timeout_s: float,
@@ -1940,16 +2296,18 @@ def _run_ask_buffered(
 ) -> tuple[str, bool, list[str]]:
     """Wait for a terminal status, then present the whole answer at once.
 
-    This is the path for ``buffered_complete`` and for a JSON consumer. It shows
-    a single explicit "waiting" notice and then the complete answer: calling
-    that streaming would be a lie about how the answer was delivered.
+    This is the path for ``buffered_complete`` and for a JSON consumer, and the
+    one :mod:`aipotluck.localapi` drives for a tool's non-streaming request. It
+    shows a single explicit "waiting" notice and then the complete answer:
+    calling that streaming would be a lie about how the answer was delivered.
 
     Returns:
         ``(status, cancelled, answer_parts)``.
 
     Raises:
         NoAvailableNodes: If no node advertised the model for the whole grace.
-        PotluckError: On the deadline, or a transport failure.
+        WaitDeadline: If the wait window closed with the request unfinished.
+        PotluckError: On a transport failure, or a cancellation.
     """
     presenter.status("waiting for generation...")
     document = _await_terminal(
@@ -1967,17 +2325,17 @@ def _run_ask_buffered(
     return str(document.get("status", "")), cancel_event.is_set(), [answer]
 
 
-def _run_ask_streaming(
+def run_streaming_answer(
     client: SignedClient,
     request_id: str,
-    presenter: _AskPresenter,
+    presenter: AnswerPresenter,
     *,
     model: str,
     timeout_s: float,
     no_node_grace_s: float,
     cancel_event: threading.Event,
 ) -> tuple[str, bool, list[str]]:
-    """Consume the center's event stream and print each increment as it arrives.
+    """Consume the center's event stream and present each increment as it arrives.
 
     How the pieces fit, and why:
 
@@ -1995,6 +2353,11 @@ def _run_ask_streaming(
     * Ctrl-C sets the cancel flag; this loop then POSTs the cancel and keeps
       reading until the terminal frame, so the user sees the real end state
       rather than a local exit.
+
+    The loop is written once and drives whichever `presenter` it is given, which
+    is how :mod:`aipotluck.localapi` streams to a tool: a second copy of the
+    reconnect-from-cursor logic is how a stream ends up splicing two answers
+    together.
 
     Returns:
         ``(status, cancelled, answer_parts)``.
@@ -2068,7 +2431,7 @@ def _run_ask_streaming(
             # not spin, and the local deadline still bounds the wait.
             cancel_sent = True
             cancel_deadline = now + ASK_CANCEL_GRACE_S
-            if _post_cancel(client, request_id):
+            if post_cancel(client, request_id):
                 publish("CANCELLED")
         if now >= deadline:
             break
@@ -2196,13 +2559,9 @@ def _cmd_ask(args: argparse.Namespace) -> int:
     mismatch look like a mysterious outage.
     """
     directory = _config_dir(args.config_dir)
-    config_document, key_document = _load_joined_identity(directory)
+    config_document, key_document = load_joined_identity(directory)
     subject_id = str(config_document["subject_id"])
-    client = SignedClient(
-        center_url=str(config_document["center_url"]),
-        key_id=str(config_document["key_id"]),
-        private_key_b64=str(key_document["private_key_b64"]),
-    )
+    client = signed_client_for(config_document, key_document)
     pending_path = directory / _PENDING_FILE
     requested_mode = "stream_strict" if args.stream else "buffered_complete"
     if args.resume:
@@ -2243,11 +2602,15 @@ def _cmd_ask(args: argparse.Namespace) -> int:
                 "online nodes",
                 file=sys.stderr,
             )
-        request_id, body = _build_ask_request(
+        request_id, body = build_signed_request(
             config_document=config_document,
             key_document=key_document,
-            question=args.question,
+            # One question is one user turn: the request model the center and the
+            # node speak is a conversation, never a flattened prompt string.
+            messages=(user_message(args.question),),
             model=model,
+            # `ask` names no parameter, so the upstream's own defaults apply.
+            parameters={},
             max_charge=args.max_charge,
             delivery_mode=requested_mode,
             deadline_ms=int(args.timeout) * 1000,
@@ -2271,7 +2634,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         if isinstance(returned, str) and returned:
             request_id = returned
         if stream_display and not args.json_output:
-            status, cancelled, parts = _run_ask_streaming(
+            status, cancelled, parts = run_streaming_answer(
                 client,
                 request_id,
                 presenter,
@@ -2281,7 +2644,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
                 cancel_event=cancel_event,
             )
         else:
-            status, cancelled, parts = _run_ask_buffered(
+            status, cancelled, parts = run_buffered_answer(
                 client,
                 request_id,
                 presenter,
@@ -2292,7 +2655,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
             )
     except NoAvailableNodes as exc:
         # Nothing can run this, so do not leave it queued: cancel it and say so.
-        _post_cancel(client, request_id)
+        post_cancel(client, request_id)
         _record_error(directory, ux.guidance_for(ux.FailureKind.NO_NODES))
         print(f"{PROG}: {exc}", file=sys.stderr)
         # The center may already have written down *why* nothing took the work —
@@ -2328,20 +2691,63 @@ def _cmd_ask(args: argparse.Namespace) -> int:
     return 0 if final_status == "SUCCEEDED" else 1
 
 
+def _cmd_serve_openai(args: argparse.Namespace) -> int:
+    """Run ``serve-openai``: the loopback endpoint until SIGINT/SIGTERM.
+
+    The endpoint raises rather than printing its own refusals, so a non-loopback
+    ``--host``, a port that is busy and a config directory with no identity in it
+    all reach `main`'s one error path and exit non-zero: a refusal to start is
+    never a silent one.
+    """
+    # Function-local: `localapi` drives this module's consumer seams, so the
+    # dependency runs one way and a module-level import would be a cycle.
+    from . import localapi
+
+    return localapi.serve_openai(
+        settings=localapi.EndpointSettings(
+            host=args.host,
+            port=args.port,
+            max_charge=args.max_charge,
+            timeout_s=args.timeout,
+            no_node_grace_s=args.no_node_grace,
+        ),
+        config_dir=_config_dir(args.config_dir),
+    )
+
+
+def _cmd_config_emit(args: argparse.Namespace) -> int:
+    """Run ``config emit``: print the configuration a tool needs.
+
+    The block goes to stdout and the guidance to stderr, so a Claude Code block
+    can be piped straight into a merge of ``settings.json`` without the guidance
+    landing inside the file. Nothing is written and no credential is read: the
+    only value emitted into a credential's slot is the endpoint's own documented
+    placeholder.
+
+    Raises:
+        PotluckError: If ``--host`` is not an address the endpoint would bind, so
+            this command cannot emit a configuration that could not work.
+    """
+    # Function-local: `configemit` renders the addresses of the endpoint
+    # `localapi` serves, and `localapi` drives this module's consumer seams, so
+    # the dependency runs one way.
+    from . import configemit
+
+    target = configemit.target_for(host=args.host, port=args.port, model=args.model)
+    if args.claude_code:
+        print(canonicalize(configemit.render_claude_code(target)).decode("utf-8"))
+        guidance = configemit.claude_code_guidance(target)
+    else:
+        print(configemit.render_shell(target), end="")
+        guidance = configemit.shell_guidance(target)
+    for line in guidance:
+        print(f"{PROG}: {line}", file=sys.stderr)
+    return 0
+
+
 # --------------------------------------------------------------------------
 # doctor: one redacted diagnostic report
 # --------------------------------------------------------------------------
-
-
-def _signed_client_for(
-    config_document: dict[str, Any], key_document: dict[str, Any]
-) -> SignedClient:
-    """Build a `SignedClient` from a saved identity's two documents."""
-    return SignedClient(
-        center_url=str(config_document["center_url"]),
-        key_id=str(config_document["key_id"]),
-        private_key_b64=str(key_document["private_key_b64"]),
-    )
 
 
 def _read_last_error(directory: Path) -> dict[str, Any] | None:
@@ -2403,7 +2809,7 @@ def _node_diagnostics(
     if config_document is None or key_document is None:
         return section
     try:
-        document = _signed_client_for(config_document, key_document).get("/v1/nodes")
+        document = signed_client_for(config_document, key_document).get("/v1/nodes")
     except PotluckError:
         return section
     nodes = document.get("nodes")
@@ -2449,7 +2855,7 @@ def _collect_diagnostics(
     config_document: dict[str, Any] | None = None
     key_document: dict[str, Any] | None = None
     try:
-        config_document, key_document = _load_joined_identity(directory)
+        config_document, key_document = load_joined_identity(directory)
     except PotluckError as exc:
         report["identity"] = {"present": False, "detail": str(exc)}
     else:
@@ -2469,7 +2875,7 @@ def _collect_diagnostics(
         report["center"]["detail"] = detail
         if reachable:
             try:
-                _signed_client_for(config_document, key_document).get("/v1/checkpoint")
+                signed_client_for(config_document, key_document).get("/v1/checkpoint")
             except PotluckError as exc:
                 guidance = ux.classify_failure(
                     error_code=getattr(exc, "error_code", None),
@@ -2607,15 +3013,22 @@ def _run_node_forever(node_path: Path) -> int:
     return 0
 
 
-def _set_share_switch(path: Path, *, enabled: bool) -> None:
-    """Rewrite ``share_enabled`` in a node configuration, atomically.
+def _rewrite_node_config(path: Path, document: dict[str, Any]) -> None:
+    """Write a node configuration atomically, at mode 0600.
 
-    The write goes to a sibling temp file and is then renamed over the target.
-    A running node polls this file, and a rename is atomic, so the poller can
-    never observe a half-written document — it either sees the old switch or the
-    new one. The temp file is created 0600 because node.json carries the
-    platform token and the device key.
+    The write goes to a sibling temp file and is then renamed over the target. A
+    running node polls this file, and a rename is atomic, so the poller can never
+    observe a half-written document — it either sees the old one or the new one.
+    The temp file is created 0600 because node.json carries the platform token,
+    the device key and the upstream credential.
     """
+    temp = path.with_name(path.name + ".tmp")
+    _write_secret_file(temp, canonicalize(document).decode("utf-8"))
+    os.replace(temp, path)
+
+
+def _set_share_switch(path: Path, *, enabled: bool) -> None:
+    """Rewrite ``share_enabled`` in a node configuration, atomically."""
     if not path.exists():
         raise PotluckError(
             f"no node configuration at {path}; run `{PROG} share setup` "
@@ -2626,10 +3039,7 @@ def _set_share_switch(path: Path, *, enabled: bool) -> None:
     if not isinstance(document, dict):
         raise PotluckError(f"node configuration {path} must be a JSON object")
     document["share_enabled"] = enabled
-    body = canonicalize(document).decode("utf-8")
-    temp = path.with_name(path.name + ".tmp")
-    _write_secret_file(temp, body)
-    os.replace(temp, path)
+    _rewrite_node_config(path, document)
 
 
 def _cmd_share_pause(args: argparse.Namespace) -> int:
@@ -3067,10 +3477,86 @@ def _confirm_live_probe() -> bool:
 def _cmd_share_setup(args: argparse.Namespace) -> int:
     """Run ``share setup``: the contributor wizard, standalone."""
     directory = _config_dir(args.config_dir)
-    identity_config, key_document = _load_joined_identity(directory)
+    identity_config, key_document = load_joined_identity(directory)
     return _run_contributor_wizard(
         args, directory=directory, identity_config=identity_config, key_document=key_document
     )
+
+
+def _imported_source(args: argparse.Namespace) -> configimport.PartialUpstream:
+    """Read the one configuration source this invocation named.
+
+    Args:
+        args: The parsed ``contribute import-config`` arguments.
+
+    Returns:
+        What that source yielded, including the fields it did not name.
+
+    Raises:
+        ConfigImportError: If the source cannot be read or is malformed.
+    """
+    if args.from_env:
+        return configimport.read_environment(os.environ)
+    if args.from_claude_code is not None:
+        return configimport.read_claude_code(Path(str(args.from_claude_code)))
+    return configimport.read_codex_config(
+        Path(str(args.from_codex)), os.environ
+    )
+
+
+def _cmd_contribute_import_config(args: argparse.Namespace) -> int:
+    """Run ``contribute import-config``: write an imported upstream into node.json.
+
+    Two cases, because they owe the operator different things. An existing
+    node.json keeps everything that belongs to this node — the platform token, the
+    device binding, the local limits, the share switch — and only its adapter
+    block is replaced. With no node.json yet, one is created from the identity
+    ``join --node`` saved, which is the only source of the device key and the
+    platform token this command will not invent.
+
+    The write is atomic and 0600 either way, because a running node polls the file
+    and because it now holds an upstream credential. Nothing printed here names
+    the key: the summary is :meth:`aipotluck.configimport.Upstream.summary`, which
+    cannot render one.
+    """
+    directory = _config_dir(args.config_dir)
+    node_path = _node_config_path(args)
+    upstream = configimport.resolve_upstream(
+        _imported_source(args),
+        endpoint=args.upstream_endpoint,
+        api_key=_read_secret(
+            args.upstream_key_file, env=UPSTREAM_KEY_ENV, what="upstream key"
+        ),
+        model=args.upstream_model,
+        name=args.upstream_name,
+    )
+    if node_path.exists():
+        merged = configimport.merge_adapter(load_document(node_path), upstream)
+        _rewrite_node_config(node_path, merged)
+        wrote = (
+            f"replaced the adapter block of {node_path} and left the rest of the "
+            "node configuration as it was"
+        )
+    else:
+        identity_config, key_document = load_joined_identity(directory)
+        _write_node_config(
+            node_path=node_path,
+            identity_config=identity_config,
+            key_document=key_document,
+            upstream=upstream.as_mapping(),
+            node_token=_resolve_node_token(directory, args.node_token_file),
+        )
+        wrote = f"wrote {node_path} from the node identity in {directory}"
+    print(f"{PROG}: imported {upstream.summary()}")
+    print(
+        f"{PROG}: {wrote}, at mode 0600; the upstream key was not printed and was "
+        "not uploaded"
+    )
+    print(
+        f"{PROG}: check it with `{PROG} share status --config {node_path}`, then "
+        f"start sharing with `{PROG} share run --config {node_path}`"
+    )
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -3139,8 +3625,8 @@ def _verify_receipt_as_consumer(directory: Path, receipt_id: str) -> ReceiptVeri
         PotluckError: If no identity is saved here, the center refuses a read, or
             an answer cannot be parsed.
     """
-    config_document, key_document = _load_joined_identity(directory)
-    client = _signed_client_for(config_document, key_document)
+    config_document, key_document = load_joined_identity(directory)
+    client = signed_client_for(config_document, key_document)
     receipt_document = client.get(f"/v1/receipts/{quote(receipt_id, safe='')}")
     return verify_receipt_from_center(
         receipt_document=receipt_document,
