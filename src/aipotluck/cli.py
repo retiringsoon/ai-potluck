@@ -195,7 +195,11 @@ _NODE_TOKEN_FILE = "node_token.json"
 #: serve, and says so when no node is online rather than dispatching a request
 #: that provably cannot be routed.
 ASK_DEFAULT_MAX_CHARGE = 20_000
-ASK_DEFAULT_TIMEOUT_S = 120.0
+#: Agent sessions are a first-class workload: thirty minutes covers a long
+#: buffered turn without anyone tuning a flag, `--timeout` lowers or raises it,
+#: and streaming calls are not length-bound by it anyway — increments keep the
+#: connection alive however long the answer runs.
+ASK_DEFAULT_TIMEOUT_S = 1800.0
 
 #: How long ``ask`` tolerates a request that has no node to run it on before it
 #: gives up. This is what keeps "no nodes" from becoming an unbounded wait: the
