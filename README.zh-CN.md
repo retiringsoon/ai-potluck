@@ -1,5 +1,8 @@
 # ai-potluck
 
+[![ci](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml/badge.svg)](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml)
+
+
 给社区拼 AI 额度的信任层。贡献者在自己机器上跑 Connector 共享闲置
 模型调用能力，上游凭据不出本机；消费者按用量付 credit；每笔消耗都有签名收据 +
 透明日志，可离线核验。

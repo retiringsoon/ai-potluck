@@ -1,5 +1,8 @@
 # ai-potluck
 
+[![ci](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml/badge.svg)](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml)
+
+
 A trust layer for communities pooling AI quota. Contributors
 run a connector on their own machine and share idle model capacity without ever
 handing over their upstream credentials. Consumers pay per use in credits, and
