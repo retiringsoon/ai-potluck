@@ -589,16 +589,28 @@ def _encode_parameter(key: str, value: Any) -> Any:
     if key in DECIMAL_CHAT_PARAMETERS:
         if isinstance(value, bool):
             raise ProtocolError(f"{key} must be a number")
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            if value != value or value in (float("inf"), float("-inf")):
-                raise ProtocolError(f"{key} must be a finite number")
-            # `repr` of a float is the shortest decimal string that reads back
-            # as the same double, so the round trip through the canonical
-            # encoder loses nothing.
-            return repr(value)
-        raise ProtocolError(f"{key} must be a number")
+        if isinstance(value, str):
+            # The string form is this function's own output: a fraction that
+            # crossed canonical JSON travels as its decimal string, and both
+            # the center's re-encode and a replay must land on the same bytes.
+            try:
+                number = float(value)
+            except ValueError:
+                raise ProtocolError(f"{key} must be a number") from None
+        elif isinstance(value, (int, float)):
+            number = float(value)
+        else:
+            raise ProtocolError(f"{key} must be a number")
+        if number != number or number in (float("inf"), float("-inf")):
+            raise ProtocolError(f"{key} must be a finite number")
+        # One canonical spelling per value: integral values encode as JSON
+        # integers, everything else as the shortest decimal string that reads
+        # back as the same double (`repr`). Encoding is idempotent, so a
+        # consumer, the center's re-encode, and a string that crossed
+        # canonical JSON all sign the same digest.
+        if number.is_integer():
+            return int(number)
+        return repr(number)
     if key in ("max_tokens", "max_completion_tokens", "seed"):
         if isinstance(value, bool) or not isinstance(value, int):
             raise ProtocolError(f"{key} must be an integer")
