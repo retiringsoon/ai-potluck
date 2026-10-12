@@ -87,6 +87,12 @@ uv pip install -e ".[dev]"
 
 ## Five minutes as a consumer
 
+AI potluck is a shared table: contributors pool AI capacity they are allowed to
+resell, and consumers spend it per question — no subscription, no key sharing.
+Every answer carries a receipt: the exact token count, a cryptographic charge
+record, and a transparency log you can verify yourself (`potluck verify
+receipt`) instead of trusting anyone's spreadsheet.
+
 Ask the operator for an invite code, then:
 
 ```bash
@@ -96,8 +102,9 @@ potluck ask "your question" --stream
 
 `join` generates an Ed25519 key on this machine (mode 0600), redeems the code at
 the center, and saves the identity to `~/.aipotluck` — later commands need no
-further setup. `ask --stream` prints each increment as it arrives. Real output
-looks like this (answer text and numbers are illustrative):
+further setup. Your invite carries a small milli-credit quota; `ask --stream`
+prints each increment as it arrives. Real output looks like this (answer text
+and numbers are illustrative):
 
 ```
 potluck: looking for available nodes
@@ -111,6 +118,29 @@ The cost line names the tokens billed and the receipt that records the charge.
 Without `--stream`, `ask` buffers: it waits, shows a `waiting for generation...` notice, then
 prints the whole answer at once. Add `--json` for a single machine-readable
 document.
+
+### Using it from your own tools
+
+Today the consumer surface is the CLI: `ask` for people, `potluck request
+--json` for scripts (submit, poll the status document, read the answer and
+receipt). The wire protocol itself is public and stable — signing, endpoints,
+and event streams are specified in the
+[network contract v0.1](docs/network-contract-v0.1.md) — so anything that can
+sign Ed25519 and speak HTTPS can integrate without the CLI. An
+OpenAI-compatible endpoint (a drop-in `base_url` for existing IDE and chat
+clients) is on the [roadmap](docs/ROADMAP.md); until it ships, a tiny wrapper
+over `potluck request` is the supported integration path.
+
+### Good to know
+
+- **Pay per use, never per month**: the invite quota is the whole budget; the
+  center declines work that would exceed it.
+- **Interrupted answers are not silent charges**: if a node disappears
+  mid-answer the attempt is marked *usage to be confirmed* and the center
+  reconciles it — you are never billed for a number nobody can produce.
+- **Your prompt travels**: the contributing node sees your prompt (it runs the
+  model). Details in [Trust model](#trust-model) and
+  [Supply compliance](#supply-compliance).
 
 ## Five minutes as a contributor
 

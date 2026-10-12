@@ -77,6 +77,10 @@ uv pip install -e ".[dev]"
 
 ## 5 分钟消费者
 
+AI potluck 是一张共享的桌子：贡献者拿出自己有权转售的 AI 额度，消费者按问题付费——
+没有订阅，不用共享 key。每个回答都带收据：精确的 token 计数、密码学扣费记录、
+以及一份你自己就能验证的透明日志（`potluck verify receipt`），不用信任何人的表格。
+
 找运营者要一个邀请码，然后：
 
 ```bash
@@ -85,8 +89,8 @@ potluck ask "你的问题" --stream
 ```
 
 `join` 在本机生成 Ed25519 密钥（0600），在中心兑换邀请码，把身份存到
-`~/.aipotluck`——之后的命令都不需要再配置。`ask --stream` 逐段显示回答。真实输出
-如下（回答文本与数字为示意）：
+`~/.aipotluck`——之后的命令都不需要再配置。邀请码自带少量 milli-credit 额度；
+`ask --stream` 逐段显示回答。真实输出如下（回答文本与数字为示意）：
 
 ```
 potluck: looking for available nodes
@@ -96,9 +100,25 @@ potluck: done
 potluck: cost 38 milli-credit (38 tokens, receipt R-1)
 ```
 
-费用行列出具 tokens 数与记录这笔费用的收据。不加 `--stream` 时为缓冲模式：先显示
-`waiting for generation...`，再一次性打印完整回答——不会冒充流式。加 `--json` 输出单个机器可读
-文档。
+费用行列出 token 计数与记录这笔费用的收据。不加 `--stream` 时为缓冲模式：先显示
+`waiting for generation...`，再一次性打印完整回答。加 `--json` 输出单个机器可读文档。
+
+### 在自己的工具里使用
+
+当前消费者入口是 CLI：人用 `ask`，脚本用 `potluck request --json`（提交、轮询状态
+文档、读取回答与收据）。线协议本身公开且稳定——签名、端点、事件流都在
+[网络契约 v0.1](docs/network-contract-v0.1.md) 里写明，任何能签 Ed25519 并讲
+HTTPS 的程序都可以不经过 CLI 接入。OpenAI 兼容端点（现有 IDE/聊天客户端的
+drop-in `base_url`）在[路线图](docs/ROADMAP.md)上；它发布之前，对
+`potluck request` 做一层小封装是受支持的接入方式。
+
+### 需要知道的
+
+- **按量付费，没有月费**：邀请码额度就是全部预算，超额工作中心直接拒绝。
+- **中断的回答不会变成糊涂账**：节点中途消失时该次尝试标记为 *usage to be
+  confirmed*，由中心对账——没人能拿出依据的数字不会扣到你头上。
+- **你的 prompt 对贡献节点可见**（模型在它那里跑）。详见
+  [信任模型](#信任模型)与[供给合规](#供给合规)。
 
 ## 5 分钟贡献者
 
