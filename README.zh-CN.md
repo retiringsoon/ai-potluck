@@ -121,46 +121,43 @@ potluck: cost 38 milli-credit (38 tokens, receipt R-1)
 
 ### 在自己的工具里使用
 
-两条入口，区别在于“这笔花费由谁授权”。
+两条入口，区别在于"谁证明了这笔消耗获得授权"。
 
-**OpenAI 兼容端点**——drop-in 的那条。中心提供 `POST /openai/v1/chat/completions`
-与 `GET /openai/v1/models`，用运营者为你这个消费者身份铸造的 API key 认证：
+**中心的 OpenAI 端点** —— 即插即用路径。中心提供
+`POST /openai/v1/chat/completions` 与 `GET /openai/v1/models`，用运营者为你的
+消费者身份铸造的 API key 认证：
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://<中心>/openai/v1",   # 指向中心，不是某个供应商
-    api_key="ak-…",                        # potluck-server admin api-key
-)
-client.chat.completions.create(
-    model="coding-pool",
-    messages=[{"role": "user", "content": "what settles a request?"}],
-)
+    base_url="https://<center>/openai/v1",   # 中心，不是供应商
+    api_key="ak-…",                          # potluck-server admin api-key
 ```
 
-你的会话**原样**到达贡献节点的 upstream——逐条 turn，而不是拼平的一句 prompt——
-连同平台转发的参数（`temperature`、`top_p`、`max_tokens`、`stop`、`seed`、`user` 等）。
-流式可用，`usage` 报的是中心真实计费的量；key 有自己的额度上限、可免重启撤销、并按
-key 限流。**没有实现、并且明确报错而不是装死**的：embeddings、旧版 completions 端点、
-`n > 1`、工具调用。完整参考（参数、错误表、限制）见
-[ai-potluck-server/docs/openai-endpoint.md](../ai-potluck-server/docs/openai-endpoint.md)。
+中心用它自己的结算密钥签署所准入的条款（`gateway_authenticated`），这条路径的
+收据可以诚实通过验证，同时如实标注这是弱于你自己签名的授权方式——文档保留这一
+区分，不把它模糊掉。
 
-**平台自己的 `/v1/*` API**——签名那条。线协议公开且稳定，写在
-[网络契约 v0.1](docs/network-contract-v0.1.md) 里，任何能签 Ed25519 并讲 HTTPS 的程序
-都可以不经过 CLI 接入；`potluck request --json` 是它上面的脚本入口。
+**本机签名代理** —— key 不出本机的路径。`potluck serve-openai` 在回环地址
+（仅 127.0.0.1）起一个端点，同时讲**两种**形状：
 
-两条路进的是同一套账：同样的计量、结算、透明日志与收据，`verify receipt` 与
-`share reconcile` 对两者都有效。有一点差别必须说清楚，因为它是**证据强度**上的差别，
-不是记账上的：签名请求带的是**你自己**对这笔具体工作与上限的签名；API key 请求带的是
-**平台**用结算密钥签署的授权，标记为 `auth_method: gateway_authenticated`——协议自带的
-第二种方式。校验按标记走，所以 API-key 收据如实通过，报 `signature_valid: pass`；它不会
-被当作消费者签名呈现，也不证明同一件事。它证明的是：中心为该主体准入了这些条款，并
-恰好计费了这个数额——而这正是收据、日志与对账要保证的。某个 build 不认识的
-`auth_method` 会作为异常报出，而不会用一个猜来的校验目的放行。
+- `POST /v1/chat/completions` 与 `GET /v1/models`（OpenAI 形状）
+- `POST /v1/messages`（Anthropic 形状——Claude Code 无需改造即可用）
 
-希望签名留在自己机器上、又不想自己写签名逻辑的调用方，
-[路线图](docs/ROADMAP.md)上还有一个**本地签名代理**（与贡献者 connector 对称）。
+每个请求都用本机 `~/.aipotluck` 身份签名；不存在可泄漏的中心签发 key，花钱的
+决定权从不离开你的手——与贡献者的 Connector 自持凭据完全对称。
+
+```bash
+potluck serve-openai            # http://127.0.0.1:8787/v1
+potluck config emit --shell         # 即贴即用的 OPENAI_BASE_URL/OPENAI_API_KEY
+potluck config emit --claude-code   # 即贴即用的 settings.json env 块
+```
+
+**贡献者**：让节点直接复用你已在用的上游——
+`potluck contribute import-config --from-claude-code|--from-codex|--from-env`
+从现有工具的配置里读出 endpoint、model 与 key 文件，写入 `node.json`
+（key 落盘 0600、永不打印），并保留其余已配置项。
 
 ### 需要知道的
 
