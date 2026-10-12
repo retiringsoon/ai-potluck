@@ -85,7 +85,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final, Protocol
 from urllib.parse import quote, urlsplit
@@ -122,7 +122,7 @@ from .reconcile import (
 )
 from .records import SpendAuthorization, new_nonce
 from .statemachine import TERMINAL_REQUEST_STATES
-from .wire import compute_request_digest, user_message
+from .wire import ChatMessage, compute_request_digest, user_message
 
 PROG = "potluck"
 
@@ -1398,7 +1398,7 @@ def _cmd_join(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
-def _load_joined_identity(directory: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def load_joined_identity(directory: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load the saved identity's config and key documents.
 
     Raises:
@@ -1422,6 +1422,23 @@ def _load_joined_identity(directory: Path) -> tuple[dict[str, Any], dict[str, An
     return config_document, _read_identity_key_file(key_path)
 
 
+def signed_client_for(
+    config_document: dict[str, Any], key_document: dict[str, Any]
+) -> SignedClient:
+    """Build a `SignedClient` from a saved identity's two documents.
+
+    One construction site for the signed consumer, shared by ``ask``,
+    ``doctor``, ``verify receipt`` and :mod:`aipotluck.localapi`: the fields an
+    identity carries are read in exactly one place, so a change to what a join
+    saves cannot leave one caller authenticating differently from the others.
+    """
+    return SignedClient(
+        center_url=str(config_document["center_url"]),
+        key_id=str(config_document["key_id"]),
+        private_key_b64=str(key_document["private_key_b64"]),
+    )
+
+
 def _signed_record_document(record: Any) -> dict[str, Any]:
     """Render a signed record as the JSON object a client POSTs."""
     return {
@@ -1437,12 +1454,13 @@ def _signed_record_document(record: Any) -> dict[str, Any]:
     }
 
 
-def _build_ask_request(
+def build_signed_request(
     *,
     config_document: dict[str, Any],
     key_document: dict[str, Any],
-    question: str,
+    messages: tuple[ChatMessage, ...],
     model: str,
+    parameters: Mapping[str, Any],
     max_charge: int,
     delivery_mode: str,
     deadline_ms: int = 60_000,
@@ -1450,11 +1468,33 @@ def _build_ask_request(
     """Build a signed authorization and the request body the center expects.
 
     The `request_digest` is computed by `compute_request_digest` from the exact
-    ``messages``/``model``/``delivery_mode`` submitted, which the center
-    re-derives at admission; a mismatch is refused, so the two must be built from
-    the same values. That is also why ``delivery_mode`` is a parameter rather
-    than a constant: the signature has to cover the mode the body actually asks
-    for.
+    ``messages``/``model``/``delivery_mode``/``parameters`` submitted, which the
+    center re-derives at admission; a mismatch is refused, so the two must be
+    built from the same values. That is also why ``delivery_mode`` is a parameter
+    rather than a constant: the signature has to cover the mode the body actually
+    asks for.
+
+    This is the one place a consumer request is minted, and both consumers of it
+    — ``ask``, which builds one user turn from a question, and
+    :mod:`aipotluck.localapi`, which forwards a tool's own conversation — drive
+    the same signature, submission and wait. A second copy is how the two paths
+    would drift apart about what a request costs.
+
+    Args:
+        config_document: The identity config a ``join`` saved.
+        key_document: The identity key file; only its private key is read.
+        messages: The conversation, forwarded to a contribution node verbatim.
+        model: The model requested; the authorization is scoped to it alone.
+        parameters: The forwarded parameters, in the canonical-safe encoding
+            :func:`aipotluck.wire.encode_chat_parameters` produces. They are
+            part of the digest, so a ceiling signed for one parameter set cannot
+            be spent on another.
+        max_charge: The charge ceiling in milli-credits.
+        delivery_mode: The delivery mode the body asks for.
+        deadline_ms: The center-side deadline the body carries.
+
+    Returns:
+        The minted request id, and the body to POST to ``/v1/requests``.
     """
     request_id = "req-" + secrets.token_hex(16)
     now = dt.datetime.now(dt.UTC)
@@ -1462,11 +1502,11 @@ def _build_ask_request(
     # The signing key id is the one the *server* derived at join; the local key
     # file no longer chooses it, so it is read from the saved config.
     key_id = str(config_document["key_id"])
-    # One question is one user turn: the request model the center and the node
-    # speak is a conversation, never a flattened prompt string.
-    messages = (user_message(question),)
     request_digest = compute_request_digest(
-        messages=messages, model=model, delivery_mode=delivery_mode
+        messages=messages,
+        model=model,
+        delivery_mode=delivery_mode,
+        parameters=parameters,
     )
     authorization = SpendAuthorization(
         authorization_id=f"auth-{request_id}",
@@ -1495,6 +1535,7 @@ def _build_ask_request(
         "idempotency_key": "idem-" + secrets.token_hex(16),
         "messages": [message.to_payload() for message in messages],
         "model": model,
+        "parameters": dict(parameters),
         "delivery_mode": delivery_mode,
         "max_attempts": 2,
         "deadline_ms": deadline_ms,
@@ -1745,14 +1786,15 @@ def _cost_line(client: SignedClient, document: dict[str, Any], subject_id: str) 
     )
 
 
-class _AskPresenter(Protocol):
-    """The single seam an ``ask`` answer is rendered through.
+class AnswerPresenter(Protocol):
+    """The single seam an answer is rendered through.
 
-    Two implementations exist (a terminal one and a JSON one), and both the
-    streaming and the buffered consumer drive the same three calls. That is
+    ``ask`` has two implementations (a terminal one and a JSON one) and
+    :mod:`aipotluck.localapi` has two more (one that collects an answer into a
+    tool's document, one that writes each increment to a tool's stream). All four
+    are driven by the same three calls from the same two wait loops. That is
     deliberate: the network loop must not contain ``print`` calls, or the next
-    change to the display becomes a change to the code that talks to the
-    network.
+    change to the display becomes a change to the code that talks to the network.
     """
 
     def status(self, text: str) -> None:
@@ -1834,12 +1876,12 @@ class _JsonPresenter:
         )
 
 
-def _presenter_for(*, json_mode: bool) -> _AskPresenter:
+def _presenter_for(*, json_mode: bool) -> AnswerPresenter:
     """Return the presenter matching the requested output format."""
     return _JsonPresenter() if json_mode else _TextPresenter()
 
 
-def _post_cancel(client: SignedClient, request_id: str) -> bool:
+def post_cancel(client: SignedClient, request_id: str) -> bool:
     """Ask the center to cancel a request, returning whether it took.
 
     Cancellation is a real end-to-end action, not a local exit: the center marks
@@ -1928,10 +1970,10 @@ def _record_error(directory: Path, guidance: ux.FailureGuidance) -> None:
         )
 
 
-def _run_ask_buffered(
+def run_buffered_answer(
     client: SignedClient,
     request_id: str,
-    presenter: _AskPresenter,
+    presenter: AnswerPresenter,
     *,
     model: str,
     timeout_s: float,
@@ -1940,9 +1982,10 @@ def _run_ask_buffered(
 ) -> tuple[str, bool, list[str]]:
     """Wait for a terminal status, then present the whole answer at once.
 
-    This is the path for ``buffered_complete`` and for a JSON consumer. It shows
-    a single explicit "waiting" notice and then the complete answer: calling
-    that streaming would be a lie about how the answer was delivered.
+    This is the path for ``buffered_complete`` and for a JSON consumer, and the
+    one :mod:`aipotluck.localapi` drives for a tool's non-streaming request. It
+    shows a single explicit "waiting" notice and then the complete answer:
+    calling that streaming would be a lie about how the answer was delivered.
 
     Returns:
         ``(status, cancelled, answer_parts)``.
@@ -1967,17 +2010,17 @@ def _run_ask_buffered(
     return str(document.get("status", "")), cancel_event.is_set(), [answer]
 
 
-def _run_ask_streaming(
+def run_streaming_answer(
     client: SignedClient,
     request_id: str,
-    presenter: _AskPresenter,
+    presenter: AnswerPresenter,
     *,
     model: str,
     timeout_s: float,
     no_node_grace_s: float,
     cancel_event: threading.Event,
 ) -> tuple[str, bool, list[str]]:
-    """Consume the center's event stream and print each increment as it arrives.
+    """Consume the center's event stream and present each increment as it arrives.
 
     How the pieces fit, and why:
 
@@ -1995,6 +2038,11 @@ def _run_ask_streaming(
     * Ctrl-C sets the cancel flag; this loop then POSTs the cancel and keeps
       reading until the terminal frame, so the user sees the real end state
       rather than a local exit.
+
+    The loop is written once and drives whichever `presenter` it is given, which
+    is how :mod:`aipotluck.localapi` streams to a tool: a second copy of the
+    reconnect-from-cursor logic is how a stream ends up splicing two answers
+    together.
 
     Returns:
         ``(status, cancelled, answer_parts)``.
@@ -2068,7 +2116,7 @@ def _run_ask_streaming(
             # not spin, and the local deadline still bounds the wait.
             cancel_sent = True
             cancel_deadline = now + ASK_CANCEL_GRACE_S
-            if _post_cancel(client, request_id):
+            if post_cancel(client, request_id):
                 publish("CANCELLED")
         if now >= deadline:
             break
@@ -2196,13 +2244,9 @@ def _cmd_ask(args: argparse.Namespace) -> int:
     mismatch look like a mysterious outage.
     """
     directory = _config_dir(args.config_dir)
-    config_document, key_document = _load_joined_identity(directory)
+    config_document, key_document = load_joined_identity(directory)
     subject_id = str(config_document["subject_id"])
-    client = SignedClient(
-        center_url=str(config_document["center_url"]),
-        key_id=str(config_document["key_id"]),
-        private_key_b64=str(key_document["private_key_b64"]),
-    )
+    client = signed_client_for(config_document, key_document)
     pending_path = directory / _PENDING_FILE
     requested_mode = "stream_strict" if args.stream else "buffered_complete"
     if args.resume:
@@ -2243,11 +2287,15 @@ def _cmd_ask(args: argparse.Namespace) -> int:
                 "online nodes",
                 file=sys.stderr,
             )
-        request_id, body = _build_ask_request(
+        request_id, body = build_signed_request(
             config_document=config_document,
             key_document=key_document,
-            question=args.question,
+            # One question is one user turn: the request model the center and the
+            # node speak is a conversation, never a flattened prompt string.
+            messages=(user_message(args.question),),
             model=model,
+            # `ask` names no parameter, so the upstream's own defaults apply.
+            parameters={},
             max_charge=args.max_charge,
             delivery_mode=requested_mode,
             deadline_ms=int(args.timeout) * 1000,
@@ -2271,7 +2319,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         if isinstance(returned, str) and returned:
             request_id = returned
         if stream_display and not args.json_output:
-            status, cancelled, parts = _run_ask_streaming(
+            status, cancelled, parts = run_streaming_answer(
                 client,
                 request_id,
                 presenter,
@@ -2281,7 +2329,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
                 cancel_event=cancel_event,
             )
         else:
-            status, cancelled, parts = _run_ask_buffered(
+            status, cancelled, parts = run_buffered_answer(
                 client,
                 request_id,
                 presenter,
@@ -2292,7 +2340,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
             )
     except NoAvailableNodes as exc:
         # Nothing can run this, so do not leave it queued: cancel it and say so.
-        _post_cancel(client, request_id)
+        post_cancel(client, request_id)
         _record_error(directory, ux.guidance_for(ux.FailureKind.NO_NODES))
         print(f"{PROG}: {exc}", file=sys.stderr)
         # The center may already have written down *why* nothing took the work —
@@ -2331,17 +2379,6 @@ def _cmd_ask(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 # doctor: one redacted diagnostic report
 # --------------------------------------------------------------------------
-
-
-def _signed_client_for(
-    config_document: dict[str, Any], key_document: dict[str, Any]
-) -> SignedClient:
-    """Build a `SignedClient` from a saved identity's two documents."""
-    return SignedClient(
-        center_url=str(config_document["center_url"]),
-        key_id=str(config_document["key_id"]),
-        private_key_b64=str(key_document["private_key_b64"]),
-    )
 
 
 def _read_last_error(directory: Path) -> dict[str, Any] | None:
@@ -2403,7 +2440,7 @@ def _node_diagnostics(
     if config_document is None or key_document is None:
         return section
     try:
-        document = _signed_client_for(config_document, key_document).get("/v1/nodes")
+        document = signed_client_for(config_document, key_document).get("/v1/nodes")
     except PotluckError:
         return section
     nodes = document.get("nodes")
@@ -2449,7 +2486,7 @@ def _collect_diagnostics(
     config_document: dict[str, Any] | None = None
     key_document: dict[str, Any] | None = None
     try:
-        config_document, key_document = _load_joined_identity(directory)
+        config_document, key_document = load_joined_identity(directory)
     except PotluckError as exc:
         report["identity"] = {"present": False, "detail": str(exc)}
     else:
@@ -2469,7 +2506,7 @@ def _collect_diagnostics(
         report["center"]["detail"] = detail
         if reachable:
             try:
-                _signed_client_for(config_document, key_document).get("/v1/checkpoint")
+                signed_client_for(config_document, key_document).get("/v1/checkpoint")
             except PotluckError as exc:
                 guidance = ux.classify_failure(
                     error_code=getattr(exc, "error_code", None),
@@ -3067,7 +3104,7 @@ def _confirm_live_probe() -> bool:
 def _cmd_share_setup(args: argparse.Namespace) -> int:
     """Run ``share setup``: the contributor wizard, standalone."""
     directory = _config_dir(args.config_dir)
-    identity_config, key_document = _load_joined_identity(directory)
+    identity_config, key_document = load_joined_identity(directory)
     return _run_contributor_wizard(
         args, directory=directory, identity_config=identity_config, key_document=key_document
     )
@@ -3139,8 +3176,8 @@ def _verify_receipt_as_consumer(directory: Path, receipt_id: str) -> ReceiptVeri
         PotluckError: If no identity is saved here, the center refuses a read, or
             an answer cannot be parsed.
     """
-    config_document, key_document = _load_joined_identity(directory)
-    client = _signed_client_for(config_document, key_document)
+    config_document, key_document = load_joined_identity(directory)
+    client = signed_client_for(config_document, key_document)
     receipt_document = client.get(f"/v1/receipts/{quote(receipt_id, safe='')}")
     return verify_receipt_from_center(
         receipt_document=receipt_document,

@@ -5,6 +5,11 @@ argument wiring, the stdout/stderr split and the exit codes are exercised the
 same way the installed ``potluck`` script uses them. The consumer network
 commands that need a running center live in the ``ai-potluck-server``
 repository's suite, beside the center they drive against.
+
+:func:`aipotluck.cli.build_signed_request` is tested here even though it belongs
+to the consumer path: minting a request needs no center, and it is the one seam
+``ask`` and ``serve-openai`` share, so what it signs is a question this suite can
+answer offline.
 """
 
 from __future__ import annotations
@@ -12,12 +17,18 @@ from __future__ import annotations
 import json
 import os
 import stat
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from aipotluck.cli import main
+from aipotluck.canonical import base64_decode, verify_payload
+from aipotluck.cli import build_signed_request, main
+from aipotluck.identity import generate_key_pair
+from aipotluck.records import DOMAIN_AUTHORIZATION
+from aipotluck.wire import ChatMessage, compute_request_digest, encode_chat_parameters
 
 DOMAIN = "AIPotluck/test/v1"
 
@@ -241,3 +252,118 @@ def test_request_without_auth_file_fails_with_actionable_message(
     assert "consumer key" in message
 
 
+
+
+def _public_key(public_key_b64: str) -> Ed25519PublicKey:
+    """Load the public key half of a generated pair."""
+    return Ed25519PublicKey.from_public_bytes(base64_decode(public_key_b64))
+
+
+def _identity_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Return a saved identity's two documents and the matching public key.
+
+    Shaped exactly as ``join`` leaves them on disk, so
+    :func:`aipotluck.cli.build_signed_request` reads the fields it reads in
+    production rather than a test-only shortcut.
+    """
+    public_key_b64, private_key_b64 = generate_key_pair()
+    config_document = {
+        "center_url": "http://127.0.0.1:1",
+        "key_id": "consumer-key-1",
+        "subject_id": "consumer-X",
+        "tenant_id": "tenant-1",
+        "role": "consumer",
+    }
+    key_document = {
+        "public_key_b64": public_key_b64,
+        "private_key_b64": private_key_b64,
+    }
+    return config_document, key_document, public_key_b64
+
+
+def _signed(
+    config_document: dict[str, Any],
+    key_document: dict[str, Any],
+    *,
+    messages: tuple[ChatMessage, ...],
+    parameters: Mapping[str, Any],
+    delivery_mode: str = "buffered_complete",
+) -> tuple[str, dict[str, Any]]:
+    """Build one signed request with the shared test identity."""
+    return build_signed_request(
+        config_document=config_document,
+        key_document=key_document,
+        messages=messages,
+        model=MODEL,
+        parameters=parameters,
+        max_charge=20_000,
+        delivery_mode=delivery_mode,
+        deadline_ms=60_000,
+    )
+
+
+def test_build_signed_request_submits_the_conversation_and_parameters_it_signs() -> None:
+    """Every turn and every forwarded parameter is in the body *and* the digest.
+
+    The center re-derives the digest from what was submitted and refuses a
+    mismatch, so a body field the signature does not cover is a field a caller
+    could change after signing. Asserting the digest equals one recomputed from
+    the same values is what pins the two together.
+    """
+    config_document, key_document, public_key_b64 = _identity_documents()
+    messages = (
+        ChatMessage(role="system", content="answer in one word"),
+        ChatMessage(role="user", content="what settles a request?"),
+        ChatMessage(role="assistant", content="a receipt"),
+        ChatMessage(role="user", content="and what backs the receipt?"),
+    )
+    parameters = encode_chat_parameters({"max_tokens": 64, "seed": 7, "stop": ["END"]})
+
+    request_id, body = _signed(
+        config_document, key_document, messages=messages, parameters=parameters
+    )
+
+    assert body["messages"] == [message.to_payload() for message in messages], (
+        "the conversation reaches the center turn by turn, not as one prompt"
+    )
+    assert body["parameters"] == {"max_tokens": 64, "seed": 7, "stop": ["END"]}
+    assert body["model"] == MODEL
+    assert body["delivery_mode"] == "buffered_complete"
+    authorization = body["authorization"]
+    payload = authorization["payload"]
+    assert payload["request_id"] == request_id
+    assert payload["consumer_id"] == "consumer-X"
+    assert payload["payer_account_id"] == "consumer-X"
+    assert payload["request_digest"] == compute_request_digest(
+        messages=messages,
+        model=MODEL,
+        delivery_mode="buffered_complete",
+        parameters=parameters,
+    )
+    assert verify_payload(
+        DOMAIN_AUTHORIZATION, payload, authorization["signature"],
+        _public_key(public_key_b64),
+    ), "the authorization the body carries is a real signature over that payload"
+
+
+def test_a_different_parameter_set_signs_a_different_request() -> None:
+    """The ceiling is bound to the parameters, not only to the conversation.
+
+    An authorization signed for a 64-token answer must not be re-pointable at a
+    4096-token one, so the two digests have to differ.
+    """
+    config_document, key_document, _ = _identity_documents()
+    messages = (ChatMessage(role="user", content="what settles a request?"),)
+
+    _, small = _signed(
+        config_document, key_document, messages=messages,
+        parameters=encode_chat_parameters({"max_tokens": 64}),
+    )
+    _, large = _signed(
+        config_document, key_document, messages=messages,
+        parameters=encode_chat_parameters({"max_tokens": 4096}),
+    )
+
+    assert small["authorization"]["payload"]["request_digest"] != (
+        large["authorization"]["payload"]["request_digest"]
+    )
