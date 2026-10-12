@@ -142,7 +142,7 @@ document.
 
 Two ways in, and they differ in what proves the spend was authorized.
 
-**An OpenAI-compatible endpoint** — the drop-in path. The center serves
+**The center's OpenAI endpoint** — the drop-in path. The center serves
 `POST /openai/v1/chat/completions` and `GET /openai/v1/models`, authenticated
 with an API key the operator mints for your consumer identity:
 
@@ -152,46 +152,34 @@ from openai import OpenAI
 client = OpenAI(
     base_url="https://<center>/openai/v1",   # the center, not a provider
     api_key="ak-…",                          # potluck-server admin api-key
-)
-client.chat.completions.create(
-    model="coding-pool",
-    messages=[{"role": "user", "content": "what settles a request?"}],
-)
 ```
 
-Your conversation reaches the contributing node's upstream **verbatim** — every
-turn, not a flattened prompt — together with the parameters the platform
-forwards (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`, `user`, …).
-Streaming works, `usage` reports what the center actually billed, and the key is
-capped by its own quota, revocable without a restart, and rate-limited. Not
-implemented, and refused by name rather than silently: embeddings, the legacy
-completions endpoint, `n > 1` and tool calling. The full reference — parameters,
-error table, limits — is
-[ai-potluck-server/docs/openai-endpoint.md](../ai-potluck-server/docs/openai-endpoint.md).
+The center signs the terms it admits with its own settlement key
+(`gateway_authenticated`), so a receipt from this path verifies honestly while
+naming a weaker authorization than your own signature — the distinction the
+docs keep rather than blur.
 
-**The platform's own `/v1/*` API** — the signed path. The wire protocol is
-public and stable, specified in the
-[network contract v0.1](docs/network-contract-v0.1.md), so anything that can sign
-Ed25519 and speak HTTPS can integrate without the CLI; `potluck request --json`
-is the scripting front end over it.
+**Your own signing proxy** — the key-stays-home path. `potluck serve-openai`
+runs a loopback endpoint (127.0.0.1 only) that speaks **both** shapes:
 
-Both paths land in the same books: same metering, same settlement, same
-transparency log, same receipts, and `verify receipt` and `share reconcile` work
-over either. One difference is worth stating plainly, because it is a difference
-in *evidence* rather than in bookkeeping: a signed request carries **your own**
-signature over the exact work and ceiling, while an API-key request carries an
-authorization the **platform** signed with its settlement key, labelled
-`auth_method: gateway_authenticated` — the protocol's second method. Verification
-follows the label, so an API-key receipt verifies honestly and reports
-`signature_valid: pass`; it is not presented as a consumer signature, and it does
-not prove the same thing. What it proves is that the center admitted these terms
-for this subject and billed exactly this amount, which is what the receipt, the
-log and the reconciliation were for. An `auth_method` a build does not define is
-reported as an anomaly rather than passed under a guessed purpose.
+- `POST /v1/chat/completions` and `GET /v1/models` (OpenAI wire)
+- `POST /v1/messages` (Anthropic wire — Claude Code works unmodified)
 
-A local signing proxy — your keys stay client-side, symmetric with the
-contributor connector — is still on the [roadmap](docs/ROADMAP.md) for callers
-who want consumer-signed authorization without writing the signing themselves.
+Every request is signed with this machine's `~/.aipotluck` identity; no center-
+issued key exists to leak, and spending authority never leaves your hands —
+symmetric with how a contributor's connector holds its own credentials.
+
+```bash
+potluck serve-openai            # http://127.0.0.1:8787/v1
+potluck config emit --shell         # paste-ready OPENAI_BASE_URL/OPENAI_API_KEY
+potluck config emit --claude-code   # paste-ready settings.json env block
+```
+
+**Contributors**: point a node at the upstream you already use —
+`potluck contribute import-config --from-claude-code|--from-codex|--from-env`
+reads the endpoint, model and key file from an existing tool's configuration,
+writes `node.json` (key at mode 0600, never printed), and preserves everything
+else already configured.
 
 ### Good to know
 
