@@ -41,6 +41,15 @@
   `verify receipt` follows the record's declared method, so such a receipt verifies honestly
   while staying distinguishable from a consumer signature.
   Reference: [ai-potluck-server/docs/openai-endpoint.md](../../ai-potluck-server/docs/openai-endpoint.md).
+- **A loopback signing proxy and the config tools** (this repo): `potluck serve-openai`
+  serves the tools' own shapes on 127.0.0.1 only — `POST /v1/chat/completions` (OpenAI)
+  and `POST /v1/messages` (Anthropic, so Claude Code works unmodified) — signing every
+  request with this machine's identity, so no center-issued key exists to leak.
+  `potluck contribute import-config` reads an upstream endpoint/model/key from a tool the
+  contributor already uses (Claude Code settings, codex config, env), and
+  `potluck config emit` prints the paste-ready consumer side. Fractional chat parameters
+  now have one canonical spelling across the signed path (`encode_chat_parameters` is
+  idempotent), so `temperature: 0.7` signs and verifies end to end.
 - **Not implemented, and refused by name rather than silently**: embeddings, the legacy
   completions endpoint, `n > 1`, and tool calling (`tools`/`tool_choice` are not forwarded, so
   this surface produces exactly one text choice). Agent clients that drive a conversation
