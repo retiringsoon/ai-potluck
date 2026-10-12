@@ -392,6 +392,42 @@ def require_bool(document: dict[str, Any], key: str, context: str) -> bool:
     return value
 
 
+def optional_bool(document: dict[str, Any], key: str, context: str, default: bool) -> bool:
+    """Return an optional boolean field, or `default` when it is absent.
+
+    Absent and malformed are different facts and get different answers. A field
+    an operator never wrote takes the documented default; a field they wrote
+    wrong is refused at load, because a config that silently reads ``"on"`` as
+    false is a config whose behaviour nobody can audit from the file.
+
+    Raises:
+        DeploymentError: If the field is present but not a boolean.
+    """
+    if key not in document:
+        return default
+    value = document[key]
+    if not isinstance(value, bool):
+        raise DeploymentError(f"{context}: field {key!r} must be a boolean")
+    return value
+
+
+def optional_int(document: dict[str, Any], key: str, context: str, default: int) -> int:
+    """Return an optional integer field, or `default` when it is absent.
+
+    ``bool`` is refused explicitly, for the reason `require_int` refuses it: it
+    is an `int` subclass in Python, and ``true`` is not a count or an amount.
+
+    Raises:
+        DeploymentError: If the field is present but not an integer.
+    """
+    if key not in document:
+        return default
+    value = document[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DeploymentError(f"{context}: field {key!r} must be an integer")
+    return value
+
+
 def require_list(document: dict[str, Any], key: str, context: str) -> list[Any]:
     """Return a required list field.
 

@@ -86,7 +86,7 @@ from .cli import (
 from .deploy import SignedClient
 from .errors import PotluckError, ProtocolError
 from .statemachine import TERMINAL_REQUEST_STATES
-from .wire import ChatMessage
+from .wire import ChatMessage, new_session_id
 
 #: The address the endpoint binds unless told otherwise. A literal rather than
 #: ``localhost``: a name is resolved through host files this process does not
@@ -600,6 +600,13 @@ class LocalEndpointServer:
         self.identity = identity
         self.settings = settings
         self.in_flight = _InFlight()
+        #: The session every request this endpoint signs is attributed to. One per
+        #: endpoint process, minted here rather than per request: an agent loop
+        #: driven through this endpoint *is* one session, and the center
+        #: aggregates a session's turns and prefers the node that served its last
+        #: one. A caller that wants its own session boundaries talks to the
+        #: center directly instead of through this loopback convenience.
+        self.session_id = new_session_id()
         self._thread: threading.Thread | None = None
         try:
             self._httpd = http.server.ThreadingHTTPServer(
@@ -654,6 +661,7 @@ class LocalEndpointServer:
             identity=self.identity,
             settings=self.settings,
             in_flight=self.in_flight,
+            session_id=self.session_id,
         )
 
     def start(self) -> None:
@@ -717,6 +725,7 @@ def _handler_class(
     identity: LocalIdentity,
     settings: EndpointSettings,
     in_flight: _InFlight,
+    session_id: str,
 ) -> type[http.server.BaseHTTPRequestHandler]:
     """Build the request handler class for one endpoint's state.
 
@@ -724,6 +733,7 @@ def _handler_class(
         identity: The identity every request is signed with.
         settings: The spending and waiting terms every request is signed with.
         in_flight: The register a shutdown cancels through.
+        session_id: The session every request this endpoint signs belongs to.
 
     Returns:
         The handler class.
@@ -930,6 +940,7 @@ def _handler_class(
                     max_charge=settings.max_charge,
                     delivery_mode=delivery_mode,
                     deadline_ms=int(settings.timeout_s * 1000),
+                    session_id=session_id,
                 )
             except PotluckError as exc:
                 # Nothing was submitted, so nothing can be billed: this is a local
@@ -1561,6 +1572,13 @@ def serve_openai(
         f"{PROG} serve-openai: signing as {identity.subject_id} with the identity in "
         f"{identity.config_dir}; no API key is checked, so any process on this machine "
         f"can spend it (send {LOCAL_API_KEY_PLACEHOLDER!r} or any other value)",
+        flush=True,
+    )
+    print(
+        f"{PROG} serve-openai: every request this run signs belongs to session "
+        f"{server.session_id}; the center aggregates it, so "
+        f"`potluck-server admin session-show --session {server.session_id}` reads "
+        f"this run's turns, tokens and cost",
         flush=True,
     )
     print(

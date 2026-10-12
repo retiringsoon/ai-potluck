@@ -54,6 +54,30 @@
   completions endpoint, `n > 1`, and tool calling (`tools`/`tool_choice` are not forwarded, so
   this surface produces exactly one text choice). Agent clients that drive a conversation
   through tool calls need the signed `/v1/*` path until that changes.
+- **Agent session support**: a request may carry a session identifier — `x-potluck-session` on
+  the OpenAI-compatible surface (an OpenAI SDK client sends it through `default_headers` and
+  changes nothing else), `session_id` in the body on the signed one — and `potluck serve-openai`
+  mints one session per endpoint run and stamps every request it signs with it. The center
+  aggregates requests, native tokens and milli-credits per `(tenant, subject, session)`, counting
+  only turns that actually settled, and `potluck-server admin session-list` / `session-show` read
+  it back — the latter listing the receipts behind the totals, so a summary can be checked
+  against the records that back it. Dispatch prefers the node that served the session's last
+  settled turn, as a preference and never a constraint: a node that disconnected, was revoked,
+  paused or declined is skipped rather than waited for. Agent context stays client-side and each
+  turn is still one separately authorized request.
+- **Long-task deadline per API key**: `admin api-key --deadline-ms` gives one key a longer
+  request window than the OpenAI surface's own default, which is what an agent loop's long turn
+  needs. It lengthens the *request*, not the HTTP connection — the surface's ~110s wait window
+  still answers `504` naming a request the center keeps running, and the turn is collected
+  afterwards through its receipt.
+- **Server-side dispatch queue**: a request no node can take right now is held rather than
+  refused, offered first-come-first-served when one frees up, and bounded by `max_queue_depth`
+  (default 100) in `center.json`, with `queue_enabled: false` for an operator who would rather
+  shed load than hold it. Both transitions ride the request's own event stream as
+  `request.queued` / `request.dispatched`. Waiting changes *when* a request is answered and never
+  whether it is billed honestly: a queued request keeps its own deadline, and the same sweep that
+  always ended an overdue request still ends it `EXPIRED` with the center's reason, no attempt
+  behind it and no charge. Queue position is best-effort, not promised.
 
 ## 🔧 Next — committed
 
@@ -81,8 +105,7 @@
 | x402-style per-call payments | machine-payable usage without accounts |
 | Docker image for the center | must-have or nice-to-have? |
 | Web chat UI | a small hosted page that talks to the OpenAI-compatible endpoint — the friendly answer for non-CLI members; CLI `ask` stays as the plumbing/test path |
-| Agent session support | long-running agent loops: session-level cost aggregation, sticky node preference, tuned long-task defaults (deadline/timeout) — pairs with the shipped OpenAI-compatible endpoint; agent context stays client-side, each turn is one authorized request |
-| Dispatch queueing / bidding | peak-vs-trough concurrency: today there is a client grace-polling wait but no server-side queue (first-come-first-served); interim backstop needs zero code — the operator runs a reserve node with a high `max_concurrency`; server-side FIFO or credit-bid-weighted ordering only if users actually feel contention |
+| Credit-bid-weighted dispatch ordering | the shipped queue is first-come-first-served and its position is explicitly not promised; would a bidder who pays more jump it, and what would that do to a pool of friends? |
 | Performance batch (deferred) | delta batching + WAL `synchronous=NORMAL` (write-path headroom for 100+-user scale) and a 500-stream load-test harness — explicitly deferred until the community tier shows real usage |
 | Retention modes | privacy-first default: billing records kept forever, prompts stored as hashes only, delivered output purged after a dispute window; training-data retention only as explicit dual-sided opt-in (contributor disclosure + consumer consent). Receipts and reconciliation stay hash-based either way |
 | PyPI publication (deferred) | distribution is source-first: one-command install from git or checkout (uv/pip/pipx) — no bundles, no PyPI for now; both channels stay revocable/deferrable, and PyPI (immutable, yank-only) is revisited only after the API stabilizes with CI secret-scanning/pre-publish checks |

@@ -146,7 +146,7 @@ from .reconcile import (
 )
 from .records import SpendAuthorization, new_nonce
 from .statemachine import TERMINAL_REQUEST_STATES
-from .wire import ChatMessage, compute_request_digest, user_message
+from .wire import ChatMessage, check_session_id, compute_request_digest, user_message
 
 PROG = "potluck"
 
@@ -1763,6 +1763,7 @@ def build_signed_request(
     max_charge: int,
     delivery_mode: str,
     deadline_ms: int = 60_000,
+    session_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Build a signed authorization and the request body the center expects.
 
@@ -1791,10 +1792,23 @@ def build_signed_request(
         max_charge: The charge ceiling in milli-credits.
         delivery_mode: The delivery mode the body asks for.
         deadline_ms: The center-side deadline the body carries.
+        session_id: The agent session this turn belongs to, or `None` for a
+            request that belongs to no session. Deliberately **not** part of the
+            digest: a session is a label the center aggregates by, not work a
+            node executes, so signing over it would make a caller re-sign to move
+            one turn between its own sessions while buying nothing — the label
+            can only ever attribute a request to a session of the same
+            authenticated subject, which is the credential's business and not the
+            body's.
 
     Returns:
         The minted request id, and the body to POST to ``/v1/requests``.
+
+    Raises:
+        ProtocolError: If `session_id` is not an identifier the wire accepts.
     """
+    if session_id is not None:
+        check_session_id(session_id)
     request_id = "req-" + secrets.token_hex(16)
     now = dt.datetime.now(dt.UTC)
     subject_id = str(config_document["subject_id"])
@@ -1841,6 +1855,8 @@ def build_signed_request(
         "max_charge_milli_credits": max_charge,
         "authorization": _signed_record_document(signed),
     }
+    if session_id is not None:
+        body["session_id"] = session_id
     return request_id, body
 
 

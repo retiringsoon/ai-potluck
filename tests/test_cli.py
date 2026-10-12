@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from aipotluck.canonical import base64_decode, verify_payload
 from aipotluck.cli import build_signed_request, main
+from aipotluck.errors import ProtocolError
 from aipotluck.identity import generate_key_pair
 from aipotluck.records import DOMAIN_AUTHORIZATION
 from aipotluck.wire import ChatMessage, compute_request_digest, encode_chat_parameters
@@ -367,3 +368,54 @@ def test_a_different_parameter_set_signs_a_different_request() -> None:
     assert small["authorization"]["payload"]["request_digest"] != (
         large["authorization"]["payload"]["request_digest"]
     )
+
+
+def test_a_session_travels_in_the_body_and_stays_out_of_the_signature() -> None:
+    """One session names a run; the digest still covers only the work.
+
+    Both halves matter. The body has to carry the identifier or the center cannot
+    attribute the turn, and the digest has to be *unchanged* by it or a caller
+    would have to re-sign to move a turn between its own sessions.
+    """
+    config_document, key_document, _ = _identity_documents()
+    messages = (ChatMessage(role="user", content="what settles a request?"),)
+    parameters = encode_chat_parameters({"max_tokens": 64})
+
+    _, with_session = build_signed_request(
+        config_document=config_document,
+        key_document=key_document,
+        messages=messages,
+        model=MODEL,
+        parameters=parameters,
+        max_charge=20_000,
+        delivery_mode="buffered_complete",
+        session_id="sess-agent-run-1",
+    )
+    _, without_session = _signed(
+        config_document, key_document, messages=messages, parameters=parameters
+    )
+
+    assert with_session["session_id"] == "sess-agent-run-1"
+    assert "session_id" not in without_session, (
+        "a request that named no session must not carry an empty one"
+    )
+    assert with_session["authorization"]["payload"]["request_digest"] == (
+        without_session["authorization"]["payload"]["request_digest"]
+    )
+
+
+def test_a_session_identifier_the_wire_refuses_is_refused_before_signing() -> None:
+    """A bad identifier fails locally rather than at the center's boundary."""
+    config_document, key_document, _ = _identity_documents()
+
+    with pytest.raises(ProtocolError):
+        build_signed_request(
+            config_document=config_document,
+            key_document=key_document,
+            messages=(ChatMessage(role="user", content="hi"),),
+            model=MODEL,
+            parameters={},
+            max_charge=20_000,
+            delivery_mode="buffered_complete",
+            session_id="two words",
+        )

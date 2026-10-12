@@ -51,6 +51,21 @@ CHAT_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
 #: one envelope is refused at admission instead of being truncated in flight.
 MAX_CHAT_MESSAGES = 512
 
+#: Longest accepted session identifier. A bound rather than a policy, for the
+#: same reason `MAX_CHAT_MESSAGES` is one: the identifier is stored on the
+#: request row, keyed into the center's session aggregate, and printed by an
+#: operator command, so it has to stay a single readable token rather than an
+#: unbounded blob a caller can use to make a listing unreadable.
+MAX_SESSION_ID_CHARS = 128
+
+#: The header an OpenAI-compatible surface reads a session identifier from.
+#: Named once here, in the package both sides already share, so a center and a
+#: client cannot drift apart about the spelling of one header. An agent
+#: framework that drives a conversation through the OpenAI SDK sets it with
+#: ``default_headers`` and needs no other change: the surface is otherwise
+#: exactly OpenAI's.
+SESSION_HEADER = "x-potluck-session"
+
 #: The request parameters a center forwards to the upstream, named exactly as
 #: OpenAI's Chat Completions API names them. Anything else in a request body is
 #: ignored rather than forwarded: the set is what the platform has decided it
@@ -105,6 +120,56 @@ MESSAGE_TYPES = frozenset(
 def new_msg_id() -> str:
     """Return a fresh, unguessable message identifier."""
     return secrets.token_hex(12)
+
+
+def new_session_id() -> str:
+    """Return a fresh, unguessable session identifier.
+
+    A session is one run of a caller's own agent loop; the context stays
+    client-side and every turn is still one separately authorized request, so
+    this identifies a *series* of requests rather than granting anything. It is
+    unguessable anyway: a center aggregates by it, and a predictable identifier
+    would let one process on a shared machine attribute its own turns to
+    somebody else's run.
+    """
+    return "sess-" + secrets.token_hex(12)
+
+
+def check_session_id(value: str) -> str:
+    """Return `value` unchanged, or refuse it as a session identifier.
+
+    The rules exist because of where the identifier travels, not because of what
+    it means: it rides in an HTTP header on the OpenAI-compatible surface, where
+    a line break would inject a field, and it is printed by an operator command,
+    where whitespace or a control character would render as a listing nobody can
+    read. Refusing is the honest answer — trimming or dropping it would leave a
+    caller believing its run was aggregated under a name the center never saw.
+
+    Args:
+        value: The identifier a caller named.
+
+    Returns:
+        The same identifier.
+
+    Raises:
+        ProtocolError: If it is empty, longer than `MAX_SESSION_ID_CHARS`, or
+            carries whitespace or a control character.
+    """
+    if not value:
+        raise ProtocolError("a session identifier must not be empty")
+    if len(value) > MAX_SESSION_ID_CHARS:
+        raise ProtocolError(
+            f"a session identifier must be at most {MAX_SESSION_ID_CHARS} "
+            f"characters, got {len(value)}"
+        )
+    for character in value:
+        if character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F:
+            raise ProtocolError(
+                f"session identifier {value!r} carries whitespace or a control "
+                "character; it travels in a header and is printed by an operator "
+                "command, so it must be one readable token"
+            )
+    return value
 
 
 def _instant(value: dt.datetime) -> dt.datetime:

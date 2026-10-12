@@ -57,6 +57,15 @@ potluck keygen --out settlement.key    # 私钥写文件（mode 0600）；stdout
 }
 ```
 
+可选字段（不写就是默认值）：
+
+```json
+{
+  "queue_enabled": true,
+  "max_queue_depth": 100
+}
+```
+
 ```sh
 chmod 600 center.json
 ```
@@ -72,6 +81,8 @@ chmod 600 center.json
 | `credentials` | 数组 | 预置 token 凭据。**留空 = 邀请制动态注册** |
 | `providers` | 数组 | 预置节点设备公钥 + 演示额度。留空，节点走 `join --node` 动态注册 |
 | `consumer_floats` | 数组 | 预铸演示额度。留空 |
+| `queue_enabled` | bool，可选 | 默认 `true`：当前无可派节点时，请求**排队等待**而不是立即拒绝；节点空出来后按到达顺序派发。设为 `false` 则立即拒绝（把负载推回客户端自己的退避），适合宁可丢弃也不愿持有未完成请求的公开中心 |
+| `max_queue_depth` | int，可选 | 默认 `100`：中心同时持有的等待请求上限。满了就答 `429`（OpenAI 面）/ `503`（`/v1/*` 面），且**不写入任何请求行**。排队不改变计费诚实性：排队的请求仍带自己的 deadline，到期由既有 sweep 转 `EXPIRED`，背后没有 attempt、不计费 |
 
 - 三个数组都可以是 `[]`，这就是邀请制的含义：成员不写进配置，靠 `admin invite` + `join` 动态注册（§7）。重启时中心会把这些动态身份从库里重放回注册表，所以邀请加入的人重启后照样能认证。
 - 文件按严格 JSON 解析：不允许浮点数、重复键或 `NaN`。
@@ -271,6 +282,8 @@ potluck-server admin invite --config ~/center/center.json --role node           
 - 选项默认值：`--role consumer`（或 `node`）、`--tenant auto`（每位加入者一个服务器派生的私有租户）、`--quota 20000`（首次加入铸入的 milli-credit）、`--expires-in 7d`、`--max-uses 1`。
 - 邀请码只在 stdout 打印一次，库里只存摘要；丢了就重新开一个。
 - `admin invite-list`（脱敏列表）、`admin revoke-key <key_id>`（撤销，立即在运行中的中心生效，无需重启）。
+- `admin api-key --deadline-ms <毫秒>`（可选）：给一把 key 上的每个请求更长的墙钟预算，用于 agent 长任务。不写则用 OpenAI 面自己的默认值。它延长的是**请求**，不是 HTTP 连接——该面的等待窗口约 110s，超过就答 `504` 并带上 request id，中心仍会把这一轮跑完，事后用 `verify receipt` 取回。详见 `ai-potluck-server/docs/openai-endpoint.md`。
+- `admin session-list [--subject <id>]` / `admin session-show --session <id>`：按 agent 会话聚合的请求数、原生 token 数、milli-credit 与最后服务的节点；`session-show` 还会列出该会话每个请求背后的收据 id，逐个都能用 `verify receipt` 单独校验。会话由调用方声明（OpenAI 面的 `x-potluck-session` 头、签名路径的 `session_id` 字段），`potluck serve-openai` 会自动为自己这一次运行生成一个并在启动时打印。
 - `serve` 正在运行时也可以执行这些命令：SQLite 用 WAL + 5s busy_timeout，读写互不阻塞。
 - 把码给朋友：消费者 `potluck join --center https://center.example.com --invite <码>`；节点 `potluck join --center … --invite <码> --node`（`--node` 会顺带跑贡献者向导）。
 
