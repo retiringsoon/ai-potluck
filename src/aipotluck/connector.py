@@ -777,7 +777,11 @@ class Connector:
         offer = accepted.offer
         attempt_id = offer.attempt_id
         try:
-            result = self._adapter.complete(offer.prompt, request_digest=offer.request_digest)
+            result = self._adapter.complete(
+                offer.messages,
+                request_digest=offer.request_digest,
+                parameters=offer.parameters,
+            )
         except AdapterQuotaExceeded as exc:
             self._store.finish_execution(attempt_id, "FAILED", at=_now())
             self._enqueue_failure(
@@ -833,7 +837,11 @@ class Connector:
                 # The call itself is inside the try: an adapter that fails before
                 # returning an iterator must fail the attempt, not escape the
                 # worker thread and leave the row SUBMITTING until the deadline.
-                chunks = self._adapter.stream(offer.prompt, request_digest=offer.request_digest)
+                chunks = self._adapter.stream(
+                    offer.messages,
+                    request_digest=offer.request_digest,
+                    parameters=offer.parameters,
+                )
                 for chunk in chunks:
                     if cancel_event.is_set():
                         return

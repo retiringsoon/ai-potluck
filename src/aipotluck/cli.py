@@ -94,7 +94,7 @@ from aipotluck.tls import client_ssl_context
 
 from . import canonical, identity, ux
 from .adapters import HttpUpstreamAdapter, probe_endpoint
-from .canonical import canonical_digest, canonicalize
+from .canonical import canonicalize
 from .connector import Connector
 from .deploy import (
     LiveEventStream,
@@ -122,6 +122,7 @@ from .reconcile import (
 )
 from .records import SpendAuthorization, new_nonce
 from .statemachine import TERMINAL_REQUEST_STATES
+from .wire import compute_request_digest, user_message
 
 PROG = "potluck"
 
@@ -1077,7 +1078,7 @@ def _cmd_request(args: argparse.Namespace) -> int:
         "/v1/requests",
         {
             "idempotency_key": args.idempotency_key,
-            "prompt": args.prompt,
+            "messages": [user_message(str(args.prompt)).to_payload()],
             "model": args.model,
             "delivery_mode": "buffered_complete",
             "max_attempts": 2,
@@ -1448,11 +1449,12 @@ def _build_ask_request(
 ) -> tuple[str, dict[str, Any]]:
     """Build a signed authorization and the request body the center expects.
 
-    The `request_digest` is computed from the exact ``prompt``/``model``/
-    ``delivery_mode`` submitted, which the center re-derives at admission; a
-    mismatch is refused, so the two must be built from the same values. That is
-    also why ``delivery_mode`` is a parameter rather than a constant: the
-    signature has to cover the mode the body actually asks for.
+    The `request_digest` is computed by `compute_request_digest` from the exact
+    ``messages``/``model``/``delivery_mode`` submitted, which the center
+    re-derives at admission; a mismatch is refused, so the two must be built from
+    the same values. That is also why ``delivery_mode`` is a parameter rather
+    than a constant: the signature has to cover the mode the body actually asks
+    for.
     """
     request_id = "req-" + secrets.token_hex(16)
     now = dt.datetime.now(dt.UTC)
@@ -1460,8 +1462,11 @@ def _build_ask_request(
     # The signing key id is the one the *server* derived at join; the local key
     # file no longer chooses it, so it is read from the saved config.
     key_id = str(config_document["key_id"])
-    request_digest = canonical_digest(
-        {"prompt": question, "model": model, "delivery_mode": delivery_mode}
+    # One question is one user turn: the request model the center and the node
+    # speak is a conversation, never a flattened prompt string.
+    messages = (user_message(question),)
+    request_digest = compute_request_digest(
+        messages=messages, model=model, delivery_mode=delivery_mode
     )
     authorization = SpendAuthorization(
         authorization_id=f"auth-{request_id}",
@@ -1488,7 +1493,7 @@ def _build_ask_request(
     )
     body = {
         "idempotency_key": "idem-" + secrets.token_hex(16),
-        "prompt": question,
+        "messages": [message.to_payload() for message in messages],
         "model": model,
         "delivery_mode": delivery_mode,
         "max_attempts": 2,
@@ -2876,7 +2881,9 @@ def _live_upstream_probe(
         name="live-probe",
     )
     try:
-        result = adapter.complete("ping", request_digest="live-probe")
+        result = adapter.complete(
+            (user_message("ping"),), request_digest="live-probe", parameters={}
+        )
     except PotluckError as exc:
         return False, f"live probe failed: {type(exc).__name__}"
     except Exception as exc:  # adapter errors are plain RuntimeErrors

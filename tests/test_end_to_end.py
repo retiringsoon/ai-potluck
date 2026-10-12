@@ -22,12 +22,15 @@ from conftest import (
     solo_contract,
 )
 
+from aipotluck.canonical import sign_payload
 from aipotluck.coordinator import Coordinator
 from aipotluck.errors import VerificationError
 from aipotluck.ledger import Ledger
 from aipotluck.records import (
+    DOMAIN_AUTHORIZATION,
     DispatchPermit,
     ProviderAcceptance,
+    SignedRecord,
     SpendAuthorization,
     new_nonce,
 )
@@ -58,6 +61,40 @@ def _authorization(keyring, now: dt.datetime) -> SpendAuthorization:
         expires_at=now + dt.timedelta(minutes=5),
         key_id="consumer-key-1",
     ).sign(keyring.private["consumer-key-1"], "consumer-key-1")
+
+
+def _platform_authorization(keyring, now: dt.datetime) -> object:
+    """Build the authorization a center mints for a request it admitted itself.
+
+    This is the protocol's second authentication method, ``gateway_authenticated``:
+    the platform's own settlement key signs the terms it admitted, because the
+    requester authenticated with a credential the center holds — an
+    operator-issued API key — rather than with a signature the requester
+    produced. The authorization is therefore real evidence of a *different*
+    strength, and the label is what keeps the two apart: settlement and
+    verification both read it to decide which key had to sign.
+    """
+    return SpendAuthorization(
+        authorization_id="auth-R1",
+        payer_account_id="consumer-X",
+        consumer_id="consumer-X",
+        request_id="R-1001",
+        request_digest="sha256:payload",
+        max_charge_milli_credits=20_000,
+        pricing_version="flat-v1",
+        billing_basis="reported_native_usage",
+        minimum_evidence_level="node_reported",
+        allowed_models=frozenset({"coding-pool"}),
+        allowed_trust_pools=frozenset({"trusted-beta"}),
+        max_attempts=2,
+        duplicate_execution_policy="bounded_model_only",
+        max_provider_fanout=2,
+        nonce=new_nonce(),
+        issued_at=now,
+        expires_at=now + dt.timedelta(minutes=5),
+        auth_method="gateway_authenticated",
+        key_id="settlement-key-1",
+    ).sign(keyring.private["settlement-key-1"], "settlement-key-1")
 
 
 def _permit(keyring, now: dt.datetime, authorization_hash: str, epoch: int = 1) -> object:
@@ -271,6 +308,96 @@ def test_offline_verification_passes_on_honest_records(
     assert outcome.account_history_complete == "pass"
     assert outcome.recomputed_earnings == {"provider-B": 8_700}
     assert outcome.recomputed_spend == {"consumer-X": 8_700}
+
+
+def test_platform_authorized_receipt_verifies_under_its_own_method(
+    keyring, ledger: Ledger, now: dt.datetime
+) -> None:
+    """A receipt behind a gateway-authenticated authorization verifies honestly.
+
+    The center admits an API-key request on a credential it holds, so the
+    authorization it stores is signed by the platform rather than by the
+    consumer. Verification follows the record's own `auth_method` instead of
+    assuming one, which is what lets an operator audit such a receipt and get a
+    true verdict: reporting `fail` here would be a false negative against the
+    platform's own promise that every charge is provable.
+    """
+    authorization = _platform_authorization(keyring, now)
+    permit = _permit(keyring, now, authorization.hash)
+    acceptance = _acceptance(keyring, now, permit.hash)
+    engine = SettlementEngine(ledger=ledger, registry=keyring.registry, log=MerkleLog())
+    contract = solo_contract("provider-B")
+    report = build_usage_report(
+        "rep-A1", permit.hash, acceptance.hash, "A1", "provider-B", "device-B",
+        make_measurement(attempt_id="A1"), "completed",
+        keyring.private["device-key-B"], "device-key-B", reported_at=now,
+    )
+    result = engine.settle(
+        "R-1001", "S1", authorization, report, contract,
+        contract_hash(contract), keyring.private["settlement-key-1"], "A1",
+        settled_at=SETTLEMENT_AT,
+    )
+    entry = engine.log_entries()[result.log_index]
+
+    outcome = verify_offline(
+        VerificationInput(
+            registry=keyring.registry,
+            authorizations=[authorization],
+            permits=[permit],
+            acceptances=[acceptance],
+            usage_reports=[report],
+            receipts=[result.receipt],
+            journals=[result.journal],
+            contracts={contract_hash(contract): contract},
+            inclusion_proofs={result.receipt.hash: result.inclusion_proof},
+            leaf_bytes={result.receipt.hash: entry.leaf_bytes()},
+            trusted_root=engine.log.root(),
+            expected_receipt_ids=[result.receipt.record_id],
+            expected_sequence=[1],
+            observed_sequence=[1],
+        )
+    )
+    assert outcome.signature_valid == "pass"
+    assert outcome.allocation_valid == "pass"
+    assert outcome.ledger_included == "pass"
+    assert not [item for item in outcome.anomalies if "spend-authorization" in item]
+    # The label survives verification: nobody may read this as a consumer
+    # signature, because the consumer never signed it.
+    assert authorization.payload["auth_method"] == "gateway_authenticated"
+
+
+def test_unknown_authorization_method_is_reported_not_passed(
+    keyring, now: dt.datetime
+) -> None:
+    """A method this build does not define has no check it could honestly pass.
+
+    The signature here is valid — the consumer key really signed this payload —
+    so the failure is attributable to the label alone. Falling back to the
+    consumer check for an unrecognised `auth_method` would let a method added
+    later inherit a trust level nobody granted it, and would report `pass` for a
+    record this build cannot interpret.
+    """
+    signed = _authorization(keyring, now)
+    payload = {**signed.payload, "auth_method": "delegated_gateway_v2"}
+    record = SignedRecord(
+        schema=signed.schema,
+        record_id=signed.record_id,
+        revision=signed.revision,
+        signed_at=signed.signed_at,
+        signer_key_id=signed.signer_key_id,
+        signer_id=signed.signer_id,
+        signature=sign_payload(
+            DOMAIN_AUTHORIZATION, payload, keyring.private["consumer-key-1"]
+        ),
+        payload=payload,
+    )
+
+    outcome = verify_offline(
+        VerificationInput(registry=keyring.registry, authorizations=[record])
+    )
+
+    assert outcome.signature_valid == "fail"
+    assert any("delegated_gateway_v2" in anomaly for anomaly in outcome.anomalies)
 
 
 def test_offline_verification_flags_wrong_payee(
