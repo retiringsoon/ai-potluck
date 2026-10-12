@@ -44,6 +44,7 @@ from aipotluck.localapi import (
     require_loopback,
 )
 from aipotluck.statemachine import TERMINAL_REQUEST_STATES
+from aipotluck.wire import compute_request_digest, user_message
 
 MODEL = "coding-pool"
 SUBJECT = "consumer-local-1"
@@ -738,6 +739,70 @@ def test_a_forwarded_parameter_reaches_the_center_inside_the_signed_body(
     _call(server, "POST", "/v1/chat/completions", _chat(max_tokens=64, temperature=1.0))
 
     assert center.admitted[0]["parameters"] == {"max_tokens": 64, "temperature": 1}
+
+
+def test_every_request_one_endpoint_signs_belongs_to_its_own_single_session(
+    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+) -> None:
+    """One endpoint run is one session, and both shapes report the same one.
+
+    The session is what lets the center aggregate an agent loop's turns and
+    prefer the node that served its last one, so the property that matters is
+    that a second call does not start a second session. Asserted over both tool
+    shapes because they are two doors into the same signing path.
+    """
+    center.answer_with(deltas=DELTAS)
+    server = endpoint()
+
+    _call(server, "POST", "/v1/chat/completions", _chat())
+    _call(
+        server,
+        "POST",
+        "/v1/messages",
+        {
+            "model": MODEL,
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": "what settles a request?"}],
+        },
+    )
+
+    sessions = [body.get("session_id") for body in center.admitted]
+    assert sessions == [server.session_id, server.session_id]
+
+
+def test_two_endpoint_runs_are_two_sessions(
+    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+) -> None:
+    """A restart is a new session, not a continuation of the one that stopped."""
+    first = endpoint()
+    second = endpoint()
+
+    assert first.session_id != second.session_id
+
+
+def test_a_session_is_a_label_the_signature_does_not_cover(
+    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+) -> None:
+    """The digest is the same with a session as without one.
+
+    A session says which run a turn belongs to; it is not work a node executes.
+    Signing over it would mean a caller has to re-sign to move a turn between its
+    own sessions, and would buy nothing: the label can only attribute a request
+    to a session of the subject the credential already authenticated.
+    """
+    center.answer_with(deltas=DELTAS)
+    server = endpoint()
+
+    _call(server, "POST", "/v1/chat/completions", _chat(max_tokens=64))
+
+    body = center.admitted[0]
+    payload = body["authorization"]["payload"]
+    assert payload["request_digest"] == compute_request_digest(
+        messages=(user_message("what settles a request?"),),
+        model=MODEL,
+        delivery_mode="buffered_complete",
+        parameters={"max_tokens": 64},
+    )
 
 
 def test_a_stream_carries_the_answer_in_pieces_and_ends_with_done(
