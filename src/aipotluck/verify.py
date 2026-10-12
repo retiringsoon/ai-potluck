@@ -214,11 +214,62 @@ def verify_offline(data: VerificationInput) -> VerificationReport:
     return report
 
 
+#: Which signing purpose an authorization's signature is checked under, keyed by
+#: the authentication method the record itself declares. ``consumer_signed`` is
+#: the consumer's own Ed25519 key: the party being charged signed the exact work
+#: and ceiling. ``gateway_authenticated`` is the platform's settlement key, for a
+#: request the center admitted on a credential it holds — an operator-issued API
+#: key — instead of a signature the consumer produced; the authorization is then
+#: the platform's own record of the terms it admitted, which is real evidence of
+#: a different strength, and the receipt keeps the label rather than presenting
+#: it as a consumer signature. A method this table does not name is reported as
+#: an anomaly instead of being checked under a guessed purpose: a label no build
+#: defined has no check it could honestly pass.
+_AUTHORIZATION_PURPOSES: dict[str, str] = {
+    "consumer_signed": "consumer",
+    "gateway_authenticated": "platform_settlement",
+}
+
+
 def _verify_signatures(data: VerificationInput) -> tuple[list[str], bool]:
     anomalies: list[str] = []
     ok = True
+    # An authorization is checked apart from the other record types because the
+    # key that had to sign it depends on the authentication method the record
+    # declares, rather than being one fixed purpose.
+    for record in data.authorizations:
+        if record.schema != SCHEMA_AUTHORIZATION:
+            anomalies.append(
+                f"record {record.record_id} claims schema {record.schema}, "
+                f"expected {SCHEMA_AUTHORIZATION}"
+            )
+            ok = False
+            continue
+        method = str(record.payload.get("auth_method", "consumer_signed"))
+        purpose = _AUTHORIZATION_PURPOSES.get(method)
+        if purpose is None:
+            anomalies.append(
+                f"{SCHEMA_AUTHORIZATION} {record.record_id} declares auth_method "
+                f"{method!r}, which this build defines no signing key for; an "
+                "unknown method is reported rather than passed"
+            )
+            ok = False
+            continue
+        try:
+            # A platform-signed authorization is verified against the identity
+            # the registry binds the settlement key to, exactly as settlement
+            # verified it when the credit moved; a consumer-signed one against
+            # the consumer it names.
+            owner_id = (
+                data.registry.get_key(record.signer_key_id).owner_id
+                if purpose == "platform_settlement"
+                else record.signer_id
+            )
+            verify_chain(data.registry, record, purpose, owner_id=owner_id)
+        except Exception as exc:
+            anomalies.append(f"{SCHEMA_AUTHORIZATION} {record.record_id}: {exc}")
+            ok = False
     checks = (
-        (data.authorizations, SCHEMA_AUTHORIZATION, "consumer"),
         (data.permits, SCHEMA_PERMIT, "platform_settlement"),
         (data.acceptances, SCHEMA_ACCEPTANCE, "provider_device"),
         (data.usage_reports, SCHEMA_USAGE, "provider_device"),
