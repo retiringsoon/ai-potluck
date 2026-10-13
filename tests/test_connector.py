@@ -1,12 +1,12 @@
 """Tests for the contribution-node connector.
 
-Every session test runs over a real TCP loopback socket. The center side is a
+Every session test runs over a real TCP loopback socket. The server side is a
 real `http.server.ThreadingHTTPServer` whose handler calls
 `aipotluck.websocket.handshake_server`, exactly as `tests/test_websocket.py` does;
 the socket layer is never mocked, because the single-sender spool behaviour is
 what is under test. The node database is a real SQLite file under `tmp_path`.
 
-The center side records every message it receives in `Link.seen`, so a test can
+The server side records every message it receives in `Link.seen`, so a test can
 assert the exact sequence of message types the node actually put on the wire.
 """
 
@@ -56,7 +56,7 @@ SECRET_TOKEN = "node-token-do-not-log-me"
 
 
 # --------------------------------------------------------------------------- #
-# Scripted center over a real socket
+# Scripted server over a real socket
 # --------------------------------------------------------------------------- #
 
 
@@ -95,7 +95,7 @@ class Link:
         return [envelope.type for envelope in self.seen]
 
 
-class Center:
+class Server:
     """A loopback WebSocket server that runs one script per node session."""
 
     def __init__(self, script: Callable[[int, Link], None]) -> None:
@@ -110,7 +110,7 @@ class Center:
         )
 
     def _handler(self) -> type:
-        center = self
+        server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -122,19 +122,19 @@ class Center:
                 try:
                     connection = handshake_server(self)
                 except Exception as exc:
-                    center.errors.append(exc)
+                    server.errors.append(exc)
                     self.close_connection = True
                     return
-                with center._lock:
-                    index = center._sessions
-                    center._sessions += 1
+                with server._lock:
+                    index = server._sessions
+                    server._sessions += 1
                 link = Link(connection)
-                with center._lock:
-                    center.links.append(link)
+                with server._lock:
+                    server.links.append(link)
                 try:
-                    center._script(index, link)
+                    server._script(index, link)
                 except BaseException as exc:
-                    center.errors.append(exc)
+                    server.errors.append(exc)
                 finally:
                     connection.close()
 
@@ -163,18 +163,18 @@ class Center:
 
 
 @pytest.fixture
-def center() -> Iterator[Callable[[Callable[[int, Link], None]], Center]]:
-    """Return a factory that starts a scripted loopback center per call."""
-    centers: list[Center] = []
+def server() -> Iterator[Callable[[Callable[[int, Link], None]], Server]]:
+    """Return a factory that starts a scripted loopback server per call."""
+    servers: list[Server] = []
 
-    def start(script: Callable[[int, Link], None]) -> Center:
-        instance = Center(script)
+    def start(script: Callable[[int, Link], None]) -> Server:
+        instance = Server(script)
         instance.start()
-        centers.append(instance)
+        servers.append(instance)
         return instance
 
     yield start
-    for instance in centers:
+    for instance in servers:
         instance.stop()
 
 
@@ -197,14 +197,14 @@ def dead_end_port() -> Iterator[int]:
 
 def make_config(
     tmp_path: object,
-    center_url: str,
+    server_url: str,
     adapter: FakeUpstreamAdapter | GatedAdapter,
     **overrides: object,
 ) -> ConnectorConfig:
-    """Build a connector config pointing at `center_url`."""
+    """Build a connector config pointing at `server_url`."""
     _, private_b64 = generate_key_pair()
     values: dict[str, object] = {
-        "center_url": center_url,
+        "server_url": server_url,
         "node_id": "node-1",
         "device_id": "device-1",
         "device_key_id": "device-key-1",
@@ -350,7 +350,7 @@ class GatedAdapter:
 # --------------------------------------------------------------------------- #
 
 
-def test_hello_advertises_open_attempts_and_empty_resume_handled(center, tmp_path) -> None:
+def test_hello_advertises_open_attempts_and_empty_resume_handled(server, tmp_path) -> None:
     """HELLO carries the open execution and device key; an empty ack is handled."""
     adapter = FakeUpstreamAdapter()
     store = NodeStore.open(str(tmp_path / "node.db"))
@@ -370,7 +370,7 @@ def test_hello_advertises_open_attempts_and_empty_resume_handled(center, tmp_pat
         observed["payload"] = hello.payload
         link.send(hello_ack())
 
-    instance = center(script)
+    instance = server(script)
     config = make_config(tmp_path, instance.url, adapter)
     connector = Connector(config, adapter=adapter, store=store)
     connector.run_once()
@@ -388,7 +388,7 @@ def test_hello_advertises_open_attempts_and_empty_resume_handled(center, tmp_pat
 # --------------------------------------------------------------------------- #
 
 
-def test_happy_path_over_a_real_socket(center, tmp_path) -> None:
+def test_happy_path_over_a_real_socket(server, tmp_path) -> None:
     """Offer → accept → execute → deltas → usage → completed, all acked."""
     adapter = FakeUpstreamAdapter()
     adapter.upstream.queue(
@@ -418,7 +418,7 @@ def test_happy_path_over_a_real_socket(center, tmp_path) -> None:
         time.sleep(0.2)
         observed["events"] = events
 
-    instance = center(script)
+    instance = server(script)
     config = make_config(tmp_path, instance.url, adapter)
     connector = Connector(config, adapter=adapter)
     connector.run_once()
@@ -484,7 +484,7 @@ def test_happy_path_over_a_real_socket(center, tmp_path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_duplicate_execute_does_not_call_the_adapter_again(center, tmp_path) -> None:
+def test_duplicate_execute_does_not_call_the_adapter_again(server, tmp_path) -> None:
     """A second EXECUTE for one attempt re-sends the spool, never re-executes."""
     adapter = FakeUpstreamAdapter()
     adapter.upstream.queue(
@@ -537,7 +537,7 @@ def test_duplicate_execute_does_not_call_the_adapter_again(center, tmp_path) -> 
             state = None
         observed["state"] = None if state is None else state.payload
 
-    instance = center(script)
+    instance = server(script)
     config = make_config(tmp_path, instance.url, adapter)
     connector = Connector(config, adapter=adapter)
     connector.run_once()
@@ -636,7 +636,7 @@ def test_offer_refused_when_concurrency_is_full(tmp_path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_reconnect_resends_unacked_spool_without_reexecuting(center, tmp_path) -> None:
+def test_reconnect_resends_unacked_spool_without_reexecuting(server, tmp_path) -> None:
     """A session that ends mid-stream resumes from the spool on the next dial."""
     adapter = FakeUpstreamAdapter()
     adapter.upstream.queue(
@@ -681,7 +681,7 @@ def test_reconnect_resends_unacked_spool_without_reexecuting(center, tmp_path) -
         observed["events"] = events
         observed["state"] = state
 
-    instance = center(script)
+    instance = server(script)
     config = make_config(tmp_path, instance.url, adapter)
     connector = Connector(config, adapter=adapter)
     connector.run_once()
@@ -709,7 +709,7 @@ def test_reconnect_resends_unacked_spool_without_reexecuting(center, tmp_path) -
 # --------------------------------------------------------------------------- #
 
 
-def test_restart_reports_unknown_rather_than_zero(center, tmp_path, caplog) -> None:
+def test_restart_reports_unknown_rather_than_zero(server, tmp_path, caplog) -> None:
     """A SUBMITTING row left by a crash becomes UNKNOWN and is never re-run."""
     adapter = FakeUpstreamAdapter()
     store = NodeStore.open(str(tmp_path / "node.db"))
@@ -731,7 +731,7 @@ def test_restart_reports_unknown_rather_than_zero(center, tmp_path, caplog) -> N
         link.send(Envelope("attempt.query", {"request_id": "R9", "attempt_id": "A9"}))
         observed["state"] = link.recv_until("attempt.state").payload
 
-    instance = center(script)
+    instance = server(script)
     config = make_config(tmp_path, instance.url, adapter)
     with caplog.at_level(logging.WARNING, logger="aipotluck.connector"):
         connector = Connector(config, adapter=adapter, store=store)
@@ -753,7 +753,7 @@ def test_restart_reports_unknown_rather_than_zero(center, tmp_path, caplog) -> N
 # --------------------------------------------------------------------------- #
 
 
-def test_heartbeat_is_emitted_when_idle(center, tmp_path) -> None:
+def test_heartbeat_is_emitted_when_idle(server, tmp_path) -> None:
     """After the idle interval the node sends a liveness heartbeat."""
     adapter = FakeUpstreamAdapter()
     observed: dict[str, object] = {}
@@ -764,7 +764,7 @@ def test_heartbeat_is_emitted_when_idle(center, tmp_path) -> None:
         link.send(hello_ack())
         observed["heartbeat"] = link.recv_until("node.heartbeat", timeout=5.0).payload
 
-    instance = center(script)
+    instance = server(script)
     config = make_config(tmp_path, instance.url, adapter, heartbeat_interval_s=1)
     connector = Connector(config, adapter=adapter)
     connector.run_once()

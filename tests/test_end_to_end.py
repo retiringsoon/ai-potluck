@@ -64,11 +64,11 @@ def _authorization(keyring, now: dt.datetime) -> SpendAuthorization:
 
 
 def _platform_authorization(keyring, now: dt.datetime) -> object:
-    """Build the authorization a center mints for a request it admitted itself.
+    """Build the authorization a server mints for a request it admitted itself.
 
     This is the protocol's second authentication method, ``gateway_authenticated``:
     the platform's own settlement key signs the terms it admitted, because the
-    requester authenticated with a credential the center holds — an
+    requester authenticated with a credential the server holds — an
     operator-issued API key — rather than with a signature the requester
     produced. The authorization is therefore real evidence of a *different*
     strength, and the label is what keeps the two apart: settlement and
@@ -315,7 +315,7 @@ def test_platform_authorized_receipt_verifies_under_its_own_method(
 ) -> None:
     """A receipt behind a gateway-authenticated authorization verifies honestly.
 
-    The center admits an API-key request on a credential it holds, so the
+    The server admits an API-key request on a credential it holds, so the
     authorization it stores is signed by the platform rather than by the
     consumer. Verification follows the record's own `auth_method` instead of
     assuming one, which is what lets an operator audit such a receipt and get a

@@ -80,7 +80,7 @@ def _node_identity(directory: Path) -> Path:
     (directory / "config.json").write_bytes(
         canonicalize(
             {
-                "center_url": "http://127.0.0.1:9",
+                "server_url": "http://127.0.0.1:9",
                 "key_id": "consumer-key-1",
                 "subject_id": "consumer-1",
                 "tenant_id": "tenant-1",
@@ -106,7 +106,7 @@ def _node_identity(directory: Path) -> Path:
 def _existing_node_config(path: Path) -> dict[str, Any]:
     """Write a node configuration a contributor already has, and return it."""
     document: dict[str, Any] = {
-        "center_url": "ws://127.0.0.1:9/v1/node-link",
+        "server_url": "ws://127.0.0.1:9/v1/node-link",
         "node_id": "device-1",
         "device_id": "device-1",
         "device_key_id": "device-key-1",
@@ -141,7 +141,7 @@ def test_claude_code_settings_yield_an_anthropic_upstream(tmp_path: Path) -> Non
     """A tool's base URL becomes the full URL this node's adapter POSTs to.
 
     Completing the path is the part an import has to get right: an endpoint that
-    merely looked correct would fail every attempt the center dispatched here.
+    merely looked correct would fail every attempt the server dispatched here.
     """
     settings = _write_claude_settings(
         tmp_path / "settings.json",

@@ -1,6 +1,6 @@
 """Contribution-node connector: the process an operator runs to share a model.
 
-The connector dials the center over one outbound WebSocket and, on that single
+The connector dials the server over one outbound WebSocket and, on that single
 link, offers the node's local policy, accepts or refuses offers, executes
 accepted attempts against the operator's own upstream credential, and reports
 signed usage.
@@ -16,7 +16,7 @@ preference:
   that drops after an upstream call has already happened still holds every
   produced event durably, because the worker wrote it before the socket ever
   saw it. On reconnect the same rows are re-sent.
-* It gives the wire exactly one ordered writer, so the center's
+* It gives the wire exactly one ordered writer, so the server's
   ``event.ack`` cursors mean something. If a worker could send directly, two
   threads could interleave frames and a contiguous-prefix ACK would no longer
   describe the stream.
@@ -104,7 +104,7 @@ def _now() -> dt.datetime:
 class ConnectorConfig:
     """Everything an operator configures to join the platform as a node."""
 
-    center_url: str
+    server_url: str
     node_id: str
     device_id: str
     device_key_id: str
@@ -141,7 +141,7 @@ def redact(config: ConnectorConfig) -> dict[str, object]:
     or a diagnostic dump; this is the only supported way to render a config.
     """
     return {
-        "center_url": config.center_url,
+        "server_url": config.server_url,
         "node_id": config.node_id,
         "device_id": config.device_id,
         "device_key_id": config.device_key_id,
@@ -188,7 +188,7 @@ class _State:
 
 
 class Connector:
-    """The contribution node's link to the center.
+    """The contribution node's link to the server.
 
     Args:
         config: Operator configuration, including the platform credential.
@@ -229,9 +229,9 @@ class Connector:
         self._policy_path = config.config_path
         self._policy_poll_interval_s = config.policy_poll_interval_s
         self._last_policy_poll = 0.0
-        #: Whether the center has spoken on this session. The spool is not
+        #: Whether the server has spoken on this session. The spool is not
         #: drained before HELLO.ACK, so a `resume` directive governs what is
-        #: replayed instead of the node pushing events the center is about to
+        #: replayed instead of the node pushing events the server is about to
         #: ask it to abandon.
         self._link_ready = False
         # Startup recovery runs exactly once, before any connection exists. A
@@ -265,7 +265,7 @@ class Connector:
         """Return whether this node is currently accepting new offers.
 
         Read by `node.hello` and `node.heartbeat`, and consulted by `_admit`, so
-        a paused node both advertises the pause (the center stops offering) and
+        a paused node both advertises the pause (the server stops offering) and
         refuses any offer that raced the advertisement.
         """
         with self._state.lock:
@@ -320,12 +320,12 @@ class Connector:
             return []
         if envelope.type == "protocol.error":
             body = ProtocolErrorBody.from_payload(payload)
-            logger.warning("center reported protocol error %s: %s", body.code, body.detail)
+            logger.warning("server reported protocol error %s: %s", body.code, body.detail)
             return []
         return [
             error_envelope(
                 "unexpected_message",
-                f"{envelope.type} is not a message a center sends to a node",
+                f"{envelope.type} is not a message a server sends to a node",
                 reply_to=envelope.msg_id,
             )
         ]
@@ -345,7 +345,7 @@ class Connector:
             connect_timeout: Overrides `config.connect_timeout_s` when given.
 
         Raises:
-            WebSocketError: If the center cannot be reached or the handshake
+            WebSocketError: If the server cannot be reached or the handshake
                 fails. The message never contains the platform credential.
         """
         timeout = (
@@ -353,14 +353,14 @@ class Connector:
         )
         headers = {"Authorization": f"Bearer {self._config.token}"}
         connection = ClientConnection.connect(
-            self._config.center_url, headers=headers, timeout=timeout
+            self._config.server_url, headers=headers, timeout=timeout
         )
         with self._state.lock:
             self._connection = connection
         try:
             self._run_session(connection)
         except WebSocketClosed:
-            logger.info("node link closed by the center; a reconnect will resume from the spool")
+            logger.info("node link closed by the server; a reconnect will resume from the spool")
         finally:
             with self._state.lock:
                 self._connection = None
@@ -506,7 +506,7 @@ class Connector:
             if self._store.get_execution(attempt_id) is not None:
                 continue
             # No execution row at all: the offer never started on this node. Say
-            # so plainly so the center can re-offer instead of billing it.
+            # so plainly so the server can re-offer instead of billing it.
             request_id, epoch = index[attempt_id]
             outgoing.append(
                 self._state_envelope(
@@ -525,7 +525,7 @@ class Connector:
             self._abandon_attempt(attempt_id)
             return []
         # resend_spool: never re-execute. Resend the unacked spool, then report
-        # the real local state so the center decides what the attempt is worth.
+        # the real local state so the server decides what the attempt is worth.
         reference = AttemptRef(directive.request_id, attempt_id, directive.epoch)
         outgoing = self._resend_envelopes(attempt_id)
         outgoing.append(self._state_envelope(reference, self._store.get_execution(attempt_id)))
@@ -725,7 +725,7 @@ class Connector:
 
         Which of the two paths runs is the only thing that differs between a
         streamed and a buffered attempt; both end by spooling the same usage
-        report and completion, so the center settles them identically.
+        report and completion, so the server settles them identically.
         """
         offer = accepted.offer
         attempt_id = offer.attempt_id
@@ -749,7 +749,7 @@ class Connector:
     def _streaming_available(self, offer: AttemptOffer) -> bool:
         """Whether this attempt should run on the adapter's streaming path.
 
-        Streaming is taken only when the center asked for `stream_strict` *and*
+        Streaming is taken only when the server asked for `stream_strict` *and*
         the adapter reports it can deliver increments. An adapter without that
         capability falls back to the buffered path rather than fabricating deltas
         that never arrived live.
@@ -816,7 +816,7 @@ class Connector:
 
         Same spool discipline as the buffered path — the worker writes only spool
         rows and the socket loop stays the sole sender — but a chunk is spooled as
-        it arrives, so the center can commit it while the model is still writing.
+        it arrives, so the server can commit it while the model is still writing.
         The execution row is left SUBMITTING until the stream ends, so a process
         killed mid-stream restarts as UNKNOWN instead of as a fabricated success.
         A stream that breaks early is reported as a failure, never as a short but
@@ -889,9 +889,9 @@ class Connector:
         a recorded fact (`record_upstream_call`); whether the upstream executed
         it is not, so the execution row ends UNKNOWN rather than FAILED. No
         failure event is spooled: an `attempt.failed` report reads as a clean
-        failure and would let the center open a replacement attempt while the
+        failure and would let the server open a replacement attempt while the
         original call may still be running upstream — the double-execution this
-        method exists to prevent. The center's tick probe asks for the attempt
+        method exists to prevent. The server's tick probe asks for the attempt
         state instead, and its reconciliation turns `certainty="unknown"` into
         OUTCOME_UNKNOWN: usage stays unknown, never zero, nobody is billed, and
         no second upstream call is made.
@@ -1080,10 +1080,10 @@ class Connector:
         while not self._stop_event.is_set():
             if self._link_ready:
                 if self.refresh_policy():
-                    # A pause/resume must reach the center promptly rather than
+                    # A pause/resume must reach the server promptly rather than
                     # waiting out the heartbeat interval: the heartbeat is what
                     # updates the node's advertised `share_enabled`, and until
-                    # it lands the center may still pick this node for new work.
+                    # it lands the server may still pick this node for new work.
                     connection.send_text(self._heartbeat_envelope().encode())
                     self._last_rx = time.monotonic()
                 self._flush_spool(connection)
@@ -1196,7 +1196,7 @@ class Connector:
         """Stop work on an attempt, mark it failed, and drop its spool silently.
 
         Used for both `cancel` and `abandon` directives. Nothing is sent for the
-        attempt: the center asked to end it, so the node does not manufacture a
+        attempt: the server asked to end it, so the node does not manufacture a
         terminal event for it.
         """
         with self._state.lock:
@@ -1220,7 +1220,7 @@ class Connector:
         `open_attempts` is the union of unfinished executions and offers this
         node accepted but has not yet executed. The index records the request
         and epoch of each, so an attempt with no execution row can still be
-        reported to the center with a complete reference.
+        reported to the server with a complete reference.
         """
         records = self._store.open_executions()
         index: dict[str, tuple[str, int]] = {
@@ -1283,7 +1283,7 @@ class Connector:
         """Build an `attempt.state` describing what this node actually did.
 
         A missing execution row is reported as FAILED/not_submitted with zero
-        upstream calls — the offer never started, so the center may re-offer it.
+        upstream calls — the offer never started, so the server may re-offer it.
         A present row reports its real state and never invents a zero: an
         UNKNOWN row stays UNKNOWN/unknown.
         """
@@ -1321,7 +1321,7 @@ class Connector:
     def _ref_from_query(self, payload: dict[str, Any]) -> AttemptRef:
         """Parse an `attempt.query` reference, filling epoch from the store.
 
-        The center's query carries only `request_id` and `attempt_id`; the epoch
+        The server's query carries only `request_id` and `attempt_id`; the epoch
         is a local fact, so it is read from the execution row when the message
         does not carry one.
 
@@ -1341,7 +1341,7 @@ class Connector:
         return AttemptRef(request_id, attempt_id, epoch)
 
     def _event_envelope(self, record: SpoolRecord) -> Envelope:
-        """Wrap a spooled payload as the `attempt.event` the center expects."""
+        """Wrap a spooled payload as the `attempt.event` the server expects."""
         return Envelope(type="attempt.event", payload=record.payload)
 
 
@@ -1380,7 +1380,7 @@ def _certainty_for(record: ExecutionRecord) -> ExecutionCertainty:
 def _signed_record_to_dict(record: SignedRecord) -> dict[str, Any]:
     """Render a signed record as the mapping carried on the wire.
 
-    The center rebuilds a `SignedRecord` from this and verifies the signature
+    The server rebuilds a `SignedRecord` from this and verifies the signature
     against the registry, so the payload and signature must travel verbatim; the
     remaining fields are the record's identity metadata.
     """

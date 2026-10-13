@@ -71,7 +71,7 @@ class AdapterOutcomeUnknown(AdapterError):
     failure: retrying an attempt whose upstream may still be running is how a
     single user request becomes two upstream bills (plan v0.3 §5.1 G04). The
     connector turns this into an ``UNKNOWN`` execution — usage stays unknown,
-    never zero, and the center's reconciliation decides the outcome.
+    never zero, and the server's reconciliation decides the outcome.
     """
 
 
@@ -227,7 +227,7 @@ class Adapter(Protocol):
     """One configured upstream a node may execute against.
 
     An adapter is a proxy for exactly one provider call: it forwards the
-    conversation and the parameters the center admitted, and reports what the
+    conversation and the parameters the server admitted, and reports what the
     upstream answered. It never rewrites the request, because a node that
     paraphrased a conversation would be billing one party for work another
     asked for.
@@ -447,7 +447,7 @@ class HttpUpstreamAdapter:
     """Adapter for one fixed HTTPS endpoint with one operator-held credential.
 
     This is the only place an upstream credential exists. It is operator
-    configuration on the node; the center never sees it. `redacted()` exists so
+    configuration on the node; the server never sees it. `redacted()` exists so
     logs and error messages can name the endpoint without echoing the key.
     """
 
@@ -987,7 +987,7 @@ def chunk_text(text: str, size: int) -> tuple[str, ...]:
 
     Used to turn a buffered completion into wire-sized deltas: the transport
     limit is a property of the link, so splitting belongs here rather than in
-    the adapter or the center.
+    the adapter or the server.
 
     Args:
         text: The full completion text.
@@ -1008,7 +1008,7 @@ def probe_endpoint(endpoint: str, *, timeout_s: float = 5.0) -> tuple[bool, str]
     """Check that an upstream host is reachable, without sending a credential.
 
     Used by the node's startup self-check so an operator learns about a blocked
-    egress path before the center dispatches work to them.
+    egress path before the server dispatches work to them.
 
     Args:
         endpoint: The configured upstream URL.

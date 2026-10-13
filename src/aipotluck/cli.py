@@ -1,6 +1,6 @@
 """Command-line entry point for the consumer and contributor side of AI potluck.
 
-The operator commands that open a center's own store or run one — ``serve``,
+The operator commands that open a server's own store or run one — ``serve``,
 ``admin invite``/``invite-list``/``revoke-key``/``reconcile``, and the operator
 view of ``verify receipt`` — live in the ``ai-potluck-server`` package's
 ``potluck-server`` command.
@@ -19,7 +19,7 @@ Offline operations:
 Reconciliation (read-only; nothing is written and no account is frozen):
 
 * ``share reconcile`` diffs this node's ``node.db`` against the attempts the
-  center says it dispatched here, and names every attempt the two sides
+  server says it dispatched here, and names every attempt the two sides
   disagree about.
 
 Contributor configuration (nothing is uploaded; an upstream key stays here):
@@ -36,7 +36,7 @@ Contributor configuration (nothing is uploaded; an upstream key stays here):
 Network operations (wired through :mod:`aipotluck.deploy`):
 
 * ``connect`` runs a contribution node from ``node.json``, probing the
-  configured upstream first so blocked egress is learned before the center
+  configured upstream first so blocked egress is learned before the server
   dispatches to the node.
 * ``request`` submits a consumer request that must carry a signed spend
   authorization (produced with ``sign`` plus the consumer key), optionally
@@ -49,14 +49,14 @@ Onboarding and consumer commands (the invite flow):
 * ``join`` generates an Ed25519 key (mode 0600), redeems an invite at
   ``POST /v1/join``, and writes ``~/.aipotluck/config.json`` so later commands
   need no further setup. A node join also receives the platform link token the
-  center minted for it — returned once, stored in ``node_token.json`` (0600),
+  server minted for it — returned once, stored in ``node_token.json`` (0600),
   never printed — so the contributor wizard needs no token an operator had to
   copy over by hand.
 * ``ask`` is the one-command consumer path: it signs a request with the joined
   identity, dispatches it, waits for the answer, and prints the text and a cost
-  line. Without ``--model`` it asks the center which models the online nodes
+  line. Without ``--model`` it asks the server which models the online nodes
   actually serve and requests the commonest one. A request that ends in a
-  failure state prints the center's own ``billing_note`` verbatim, so "did not
+  failure state prints the server's own ``billing_note`` verbatim, so "did not
   finish" is never the whole story. Answers are delivered in buffered mode today
   (the display is a replaceable function so a streaming worker can make it
   incremental).
@@ -132,6 +132,7 @@ from .deploy import (
     load_node,
     poll_request_until_terminal,
     redacted_node,
+    reject_renamed_keys,
 )
 from .errors import CanonicalizationError, PotluckError, UnknownKeyError
 from .identity import generate_key_pair, load_private_key
@@ -142,7 +143,7 @@ from .reconcile import (
     NodeAttemptView,
     ReceiptVerification,
     reconcile_node,
-    verify_receipt_from_center,
+    verify_receipt_from_server,
 )
 from .records import SpendAuthorization, new_nonce
 from .statemachine import TERMINAL_REQUEST_STATES
@@ -174,12 +175,12 @@ _KEY_FILE = "key.json"
 _PENDING_FILE = "pending.json"
 _NODE_FILE = "node.json"
 _LAST_ERROR_FILE = "last_error.json"
-#: Where ``join --node`` keeps the platform node-link token the center returned
+#: Where ``join --node`` keeps the platform node-link token the server returned
 #: once. A file of its own rather than a field of ``key.json`` or
 #: ``config.json``: ``config.json`` holds only non-secret identifiers (it is
 #: written world-readable and ``doctor`` reasons about it), ``key.json`` is the
 #: identity's key material, and a platform credential has a different lifecycle
-#: from both — it is issued by the center, it can be revoked on its own, and
+#: from both — it is issued by the server, it can be revoked on its own, and
 #: losing it is repaired by re-joining, not by regenerating a key. Like
 #: ``key.json`` it is written 0600 by :func:`_write_secret_file` and its value
 #: is never printed.
@@ -189,7 +190,7 @@ _NODE_TOKEN_FILE = "node_token.json"
 #
 #: There is deliberately no default *model*. A hardcoded one (this build used to
 #: default to the test pool's name) is a guess the consumer cannot verify and
-#: the center will not honour: model names are whatever each contributor's
+#: the server will not honour: model names are whatever each contributor's
 #: upstream calls them. ``ask`` therefore reads the models the online nodes
 #: actually advertise through ``GET /v1/nodes`` and picks the one most of them
 #: serve, and says so when no node is online rather than dispatching a request
@@ -203,7 +204,7 @@ ASK_DEFAULT_TIMEOUT_S = 1800.0
 
 #: How long ``ask`` tolerates a request that has no node to run it on before it
 #: gives up. This is what keeps "no nodes" from becoming an unbounded wait: the
-#: center leaves such a request in ``ROUTING`` forever, so the bound has to be
+#: server leaves such a request in ``ROUTING`` forever, so the bound has to be
 #: imposed by the client. The value is short because "nothing happened for a
 #: while and there is nobody to do the work" is the useful signal.
 ASK_NO_NODE_GRACE_S = 3.0
@@ -326,7 +327,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     verify = subparsers.add_parser(
         "verify",
-        help="Verify one signature, or one receipt against the center's books.",
+        help="Verify one signature, or one receipt against the server's books.",
         description=(
             "Two unrelated checks share this command. With no subcommand it "
             "verifies a domain-separated signature and exits 0 with OK when it "
@@ -374,7 +375,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "then stays `unknown`, because a consumer holds no signed usage "
             "report, and the command says so rather than substituting the "
             "receipt's declared level. The operator-side view that reads a "
-            "center's own database is `potluck-server verify receipt`.\n\n"
+            "server's own database is `potluck-server verify receipt`.\n\n"
             "Nothing is written and nothing is frozen. Exit 0 when no dimension "
             "reported a contradiction, 1 when one did; `unknown` is not a "
             "contradiction."
@@ -401,7 +402,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run a contribution node from its node.json until SIGINT/SIGTERM.",
         description=(
             "Load a node configuration, probe the configured upstream, and "
-            "hold the outbound link to the center until interrupted."
+            "hold the outbound link to the server until interrupted."
         ),
     )
     connect.add_argument(
@@ -423,7 +424,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     request.add_argument("--config", required=True, type=Path, metavar="PATH",
-                         help="consumer.json with center_url and token.")
+                         help="consumer.json with server_url and token.")
     request.add_argument("--prompt", required=True, help="The request text.")
     request.add_argument("--model", required=True, help="Model being requested.")
     request.add_argument("--request-id", required=True, dest="request_id",
@@ -446,7 +447,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="GET /v1/requests/{id} and print the document canonically.",
     )
     status.add_argument("--config", required=True, type=Path, metavar="PATH",
-                        help="consumer.json with center_url and token.")
+                        help="consumer.json with server_url and token.")
     status.add_argument("--request-id", required=True, dest="request_id")
     status.set_defaults(handler=_cmd_status)
 
@@ -459,7 +460,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     events.add_argument("--config", required=True, type=Path, metavar="PATH",
-                        help="consumer.json with center_url and token.")
+                        help="consumer.json with server_url and token.")
     events.add_argument("--request-id", required=True, dest="request_id")
     events.add_argument("--cursor", type=int, default=0,
                         help="Highest event cursor already seen (default 0).")
@@ -477,15 +478,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Redeem an invite and save this machine's identity.",
         description=(
             "Generate an Ed25519 key (mode 0600), redeem the invite code at the "
-            "center, and write the identity to the config directory. The private "
-            "key is never printed. With --node the center also issues this "
+            "server, and write the identity to the config directory. The private "
+            "key is never printed. With --node the server also issues this "
             "node's platform link token, which is saved to node_token.json "
             "(0600) and never printed; the contributor wizard then needs no "
             "token from you. Re-running with the saved key is idempotent and "
             "issues no second token."
         ),
     )
-    join.add_argument("--center", required=True, help="Center base URL, e.g. http://host:port.")
+    join.add_argument("--server", required=True, help="Server base URL, e.g. http://host:port.")
     join.add_argument(
         "--invite", required=True, help="Invite code from `potluck-server admin invite`."
     )
@@ -532,7 +533,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ask = subparsers.add_parser(
         "ask",
-        help="Ask the center a question with the joined identity.",
+        help="Ask the server a question with the joined identity.",
         description=(
             "Sign a request with the identity saved by `join`, dispatch it, wait "
             "for the answer, and print the text and a cost line. With --stream "
@@ -624,8 +625,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "loopback reachability *is* the threat model rather than a key check "
             "that would add a prompt and no boundary. What loopback binding does "
             "buy is the property that matters: the signing key never leaves this "
-            "machine, which is the difference from the center's own "
-            "OpenAI-compatible surface at <center-url>/openai/v1, where the center "
+            "machine, which is the difference from the server's own "
+            "OpenAI-compatible surface at <server-url>/openai/v1, where the server "
             "holds bounded spending authority over a key it issued.\n\n"
             f"Point a tool at it with `{PROG} config emit --shell` or "
             f"`{PROG} config emit --claude-code`."
@@ -685,7 +686,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "doctor",
         help="Export a redacted diagnostic report for this machine.",
         description=(
-            "Print version, configuration summary, center reachability, whether "
+            "Print version, configuration summary, server reachability, whether "
             "the saved credential still works, contribution-node status, the "
             "count of unfinished local requests, and the last error code. The "
             "report never contains a token, a private key, or an upstream key."
@@ -733,11 +734,11 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Confirm this machine's upstream address/key/model, write them into "
             "the local node configuration, then check upstream reachability, "
-            "configuration completeness, and center reachability. The platform "
+            "configuration completeness, and server reachability. The platform "
             "node token is normally the one `join --node` already saved, so an "
             "invited contributor is not asked for it; --node-token-file or "
             f"{NODE_TOKEN_ENV} override it for a token an operator provisioned "
-            "in the center by hand. The upstream key and any token are read "
+            "in the server by hand. The upstream key and any token are read "
             "from a file or the environment, never from a command-line "
             "argument, and are never printed."
         ),
@@ -751,7 +752,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Start sharing this machine's upstream until interrupted.",
         description=(
             "Load node.json, check the configured upstream, and hold the "
-            "outbound link to the center. `share pause`/`resume` from another "
+            "outbound link to the server. `share pause`/`resume` from another "
             "shell take effect within the poll interval without a restart."
         ),
     )
@@ -771,7 +772,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Set share_enabled=false in the local node configuration. A running "
             "`potluck share run` picks it up within its poll interval and the "
-            "center stops offering it new attempts; work already in flight is "
+            "server stops offering it new attempts; work already in flight is "
             "allowed to finish."
         ),
     )
@@ -799,7 +800,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print this machine's share state, redacted.",
         description=(
             "Show whether sharing is enabled, the local limits, the configured "
-            "upstream, and whether the center currently lists this node. Never "
+            "upstream, and whether the server currently lists this node. Never "
             "prints a token, a private key, or an upstream key."
         ),
     )
@@ -812,17 +813,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
     share_reconcile = share_sub.add_parser(
         "reconcile",
-        help="Diff this node's own record against what the center claims.",
+        help="Diff this node's own record against what the server claims.",
         description=(
             "Compare what this machine durably recorded — every execution it "
-            "started, how far the center acknowledged it, and any usage report "
-            "it signed that is still undelivered — with the attempts the center "
+            "started, how far the server acknowledged it, and any usage report "
+            "it signed that is still undelivered — with the attempts the server "
             "says it dispatched to this node. Both directions are checked: an "
-            "execution the center never heard of is work this node may have paid "
-            "an upstream for and never been billed for, and a center attempt "
+            "execution the server never heard of is work this node may have paid "
+            "an upstream for and never been billed for, and a server attempt "
             "with no local execution is a dispatch this node has no record of "
             "running.\n\n"
-            "Reads node.db and one read-only center endpoint scoped to this "
+            "Reads node.db and one read-only server endpoint scoped to this "
             "node's own credential. Nothing is written on either side and no "
             "account is frozen. Exit 0 when the two sides agree, 1 when any "
             "difference stands, and every difference names its attempt."
@@ -1090,7 +1091,7 @@ def _add_node_token_argument(parser: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help=(
             "File holding a platform node-link token the operator provisioned "
-            "in the center's credentials[] by hand, overriding the one `join` "
+            "in the server's credentials[] by hand, overriding the one `join` "
             f"saved. Alternatively set {NODE_TOKEN_ENV}. The invite path needs "
             "neither."
         ),
@@ -1326,8 +1327,8 @@ def install_stop_handlers(stop: threading.Event) -> bool:
 def _cmd_connect(args: argparse.Namespace) -> int:
     """Run the ``connect`` subcommand: a node until SIGINT/SIGTERM.
 
-    Before dialing the center, an http adapter's upstream is probed without
-    credentials, so an operator learns about blocked egress before the center
+    Before dialing the server, an http adapter's upstream is probed without
+    credentials, so an operator learns about blocked egress before the server
     dispatches work to this node and every attempt fails at the adapter. This is
     the same routine ``share run`` uses, so the two entry points cannot drift.
     """
@@ -1393,7 +1394,7 @@ def _cmd_request(args: argparse.Namespace) -> int:
     request_id = str(result.get("request_id", ""))
     if not request_id:
         raise PotluckError(
-            "the center accepted the request but returned no request_id; "
+            "the server accepted the request but returned no request_id; "
             f"response was {result!r}"
         )
     print(request_id)
@@ -1504,10 +1505,10 @@ def _read_identity_key_file(path: Path) -> dict[str, Any]:
 
 
 def _save_node_token(directory: Path, token: str) -> Path:
-    """Persist the center's one-time node-link token, returning the path written.
+    """Persist the server's one-time node-link token, returning the path written.
 
     The plaintext travels exactly once, in the ``POST /v1/join`` response: the
-    center stores only its digest and cannot show it again. This file is
+    server stores only its digest and cannot show it again. This file is
     therefore the sole copy, so it is written through
     :func:`_write_secret_file` (0600 regardless of umask) and its value is never
     printed by this module. A contributor who loses it recovers by having an
@@ -1544,7 +1545,7 @@ def _read_saved_config(path: Path) -> dict[str, Any]:
     """Return a previously saved identity config, or ``{}``.
 
     Used to keep fields a re-join response does not repeat. ``join`` is
-    idempotent on the public key, and the center's idempotent answer names the
+    idempotent on the public key, and the server's idempotent answer names the
     identity but not the device ids it derived on the first join — so a re-join
     that overwrote the file wholesale would silently drop the device binding and
     break the wizard that reads it back. Unreadable or malformed state is
@@ -1568,7 +1569,7 @@ def _post_json(url: str, body: dict[str, Any], *, timeout_s: float = 30.0) -> di
     """
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise PotluckError(f"center URL must be an absolute http(s) URL, not {url!r}")
+        raise PotluckError(f"server URL must be an absolute http(s) URL, not {url!r}")
     port = parts.port or (443 if parts.scheme == "https" else 80)
     target = parts.path or "/"
     if parts.query:
@@ -1609,14 +1610,14 @@ def _cmd_join(args: argparse.Namespace) -> int:
     The identity itself (subject, key id, tenant) is **derived by the server**,
     so this command sends only the public key (and, for a node, the device
     public key) and stores the derived ids it gets back. Re-running with the
-    saved key is idempotent: the center returns the same identity, funds nothing
+    saved key is idempotent: the server returns the same identity, funds nothing
     twice, mints no second node token, and does not consume another invite use.
 
-    A node join additionally receives the platform link token the center minted
+    A node join additionally receives the platform link token the server minted
     for it and stores it in ``node_token.json`` (0600). That is what closes the
     contributor loop: the wizard reads the token back from there, so nobody has
-    to copy a credential out of ``center.json`` by hand. The token is shown
-    once by the center and never echoed here.
+    to copy a credential out of ``server.json`` by hand. The token is shown
+    once by the server and never echoed here.
     """
     directory = _config_dir(args.config_dir)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1641,9 +1642,9 @@ def _cmd_join(args: argparse.Namespace) -> int:
         # device_key_id and provider_id from this join's token.
         device = {"public_key_b64": device_public}
     _write_secret_file(key_path, json.dumps(document))
-    center = args.center.rstrip("/")
+    server = args.server.rstrip("/")
     result = _post_json(
-        f"{center}/v1/join",
+        f"{server}/v1/join",
         {
             "invite_code": args.invite,
             "identity": {
@@ -1654,7 +1655,7 @@ def _cmd_join(args: argparse.Namespace) -> int:
         },
     )
     config_document = {
-        "center_url": args.center,
+        "server_url": args.server,
         "key_id": result["key_id"],
         "subject_id": result["subject_id"],
         "tenant_id": result["tenant_id"],
@@ -1679,7 +1680,7 @@ def _cmd_join(args: argparse.Namespace) -> int:
         token_path = _save_node_token(directory, node_token)
         print(
             f"{PROG}: platform node token saved to {token_path} (0600, never printed); "
-            "the center keeps only its digest, so if it is lost ask the operator to run "
+            "the server keeps only its digest, so if it is lost ask the operator to run "
             "`admin revoke-key` and re-join with a fresh invite"
         )
     if args.node and not args.no_setup:
@@ -1705,20 +1706,22 @@ def load_joined_identity(directory: Path) -> tuple[dict[str, Any], dict[str, Any
     """Load the saved identity's config and key documents.
 
     Raises:
-        PotluckError: If either file is absent or malformed.
+        PotluckError: If either file is absent or malformed, or the config
+            carries a key listed in ``RENAMED_CONFIG_KEYS``.
     """
     config_path = directory / _CONFIG_FILE
     key_path = directory / _KEY_FILE
     if not config_path.exists() or not key_path.exists():
         raise PotluckError(
             f"no identity found in {directory}; run "
-            f"`{PROG} join --center <url> --invite <code>` first"
+            f"`{PROG} join --server <url> --invite <code>` first"
         )
     raw = read_text_file(config_path, what="identity config")
     config_document = canonical.loads_strict(raw)
     if not isinstance(config_document, dict):
         raise PotluckError(f"identity config {config_path} must be a JSON object")
-    for field in ("center_url", "key_id", "subject_id", "tenant_id", "role"):
+    reject_renamed_keys(config_document, f"identity config {config_path}")
+    for field in ("server_url", "key_id", "subject_id", "tenant_id", "role"):
         value = config_document.get(field)
         if not isinstance(value, str) or not value:
             raise PotluckError(f"identity config {config_path} is missing {field!r}")
@@ -1736,7 +1739,7 @@ def signed_client_for(
     saves cannot leave one caller authenticating differently from the others.
     """
     return SignedClient(
-        center_url=str(config_document["center_url"]),
+        server_url=str(config_document["server_url"]),
         key_id=str(config_document["key_id"]),
         private_key_b64=str(key_document["private_key_b64"]),
     )
@@ -1769,11 +1772,11 @@ def build_signed_request(
     deadline_ms: int = 60_000,
     session_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Build a signed authorization and the request body the center expects.
+    """Build a signed authorization and the request body the server expects.
 
     The `request_digest` is computed by `compute_request_digest` from the exact
     ``messages``/``model``/``delivery_mode``/``parameters`` submitted, which the
-    center re-derives at admission; a mismatch is refused, so the two must be
+    server re-derives at admission; a mismatch is refused, so the two must be
     built from the same values. That is also why ``delivery_mode`` is a parameter
     rather than a constant: the signature has to cover the mode the body actually
     asks for.
@@ -1795,10 +1798,10 @@ def build_signed_request(
             be spent on another.
         max_charge: The charge ceiling in milli-credits.
         delivery_mode: The delivery mode the body asks for.
-        deadline_ms: The center-side deadline the body carries.
+        deadline_ms: The server-side deadline the body carries.
         session_id: The agent session this turn belongs to, or `None` for a
             request that belongs to no session. Deliberately **not** part of the
-            digest: a session is a label the center aggregates by, not work a
+            digest: a session is a label the server aggregates by, not work a
             node executes, so signing over it would make a caller re-sign to move
             one turn between its own sessions while buying nothing — the label
             can only ever attribute a request to a session of the same
@@ -1865,7 +1868,7 @@ def build_signed_request(
 
 
 class NoAvailableNodes(PotluckError):
-    """Raised when the center has no node able to run the requested model.
+    """Raised when the server has no node able to run the requested model.
 
     A distinct type rather than a message match: ``ask`` reacts to this by
     cancelling the request it already submitted, which it must not do for a
@@ -1878,34 +1881,34 @@ class WaitDeadline(PotluckError):
 
     A distinct type rather than a message match, for the same reason as
     `NoAvailableNodes`: a deadline is not a refusal. The work may still be
-    running at the center and may still be billed, so
+    running at the server and may still be billed, so
     :mod:`aipotluck.localapi` answers it as ``504 deadline_passed`` with the
-    billing-honest message, while a center refusal is answered with the code the
-    center itself named. Telling those apart by parsing a message is how a
+    billing-honest message, while a server refusal is answered with the code the
+    server itself named. Telling those apart by parsing a message is how a
     request that may still cost something comes to be reported as a failure of
     the platform.
     """
 
 
 def _print_billing_note(document: dict[str, Any]) -> None:
-    """Print the center's own one-line reason for a request that did not succeed.
+    """Print the server's own one-line reason for a request that did not succeed.
 
     Why this exists: a FAILED request used to render as "did not finish" and
-    nothing else, while the center had already written the actual cause — ``no
+    nothing else, while the server had already written the actual cause — ``no
     node left to take the work: local budget would be exceeded: 0 + 20000 >
     5000`` — into ``requests.billing_note`` and returned it in the status
     document. Swallowing it turned a diagnosable configuration mismatch into an
     unexplained failure.
 
     The note is printed verbatim rather than classified or paraphrased: it is
-    the center's wording, and a second rendering of it would be a second source
+    the server's wording, and a second rendering of it would be a second source
     of truth about why a request failed. It is assembled from request and
     attempt ids, numbers, and node-reported failure text, never from a
-    credential, so surfacing it does not widen what leaves the center.
+    credential, so surfacing it does not widen what leaves the server.
     """
     note = document.get("billing_note")
     if isinstance(note, str) and note:
-        print(f"{PROG}: center note: {note}", file=sys.stderr)
+        print(f"{PROG}: server note: {note}", file=sys.stderr)
 
 
 def _model_nodes(client: SignedClient, model: str) -> list[dict[str, Any]]:
@@ -1943,7 +1946,7 @@ def _default_model_from_nodes(client: SignedClient) -> str | None:
     depend on the order a listing happened to arrive in.
 
     Only nodes that could actually take the work are counted — the same
-    ``share_enabled`` filter :func:`_model_nodes` and the center's own
+    ``share_enabled`` filter :func:`_model_nodes` and the server's own
     ``_pick_node`` apply — so a paused node cannot contribute a model that then
     cannot be dispatched.
 
@@ -1956,7 +1959,7 @@ def _default_model_from_nodes(client: SignedClient) -> str | None:
             than flattened into `None` on purpose: an unreadable listing says
             nothing about whether a node exists, and reporting it as "no model"
             would hide the real cause — a revoked credential or an unreachable
-            center has its own remedy, and masking it as an empty platform is
+            server has its own remedy, and masking it as an empty platform is
             how a user ends up waiting for contributors instead of re-joining.
     """
     document = client.get("/v1/nodes")
@@ -1988,7 +1991,7 @@ def _await_terminal(
 
     Two bounds, not one. `timeout_s` is the overall budget; `no_node_grace_s`
     is the much shorter "nothing can run this, and nothing is coming" bound. A
-    request with no eligible node sits in ``ROUTING`` until the center's
+    request with no eligible node sits in ``ROUTING`` until the server's
     deadline, so waiting out `timeout_s` would mean a user staring at a
     two-minute silence for a request that provably cannot start. The node list
     is consulted each poll, and the grace only starts once the list is empty,
@@ -2008,7 +2011,7 @@ def _await_terminal(
     Raises:
         NoAvailableNodes: If no node advertised the model for the whole grace.
         WaitDeadline: If the wait window closed with the request unfinished.
-        PotluckError: If the user cancelled, or a read of the center failed.
+        PotluckError: If the user cancelled, or a read of the server failed.
     """
     deadline = time.monotonic() + timeout_s
     empty_since: float | None = None
@@ -2065,7 +2068,7 @@ def _cost_line(client: SignedClient, document: dict[str, Any], subject_id: str) 
     A request with no settlement revision is reported through
     :func:`aipotluck.ux.uncertain_usage_cost_text`, never as a charge of zero:
     "we have not been told the price" and "the price is zero" are different
-    statements, and only one of them is a claim the center can support.
+    statements, and only one of them is a claim the server can support.
 
     The same reasoning covers a settled request that did not succeed. A
     cancelled or failed request is settled provisionally — the model may have
@@ -2209,9 +2212,9 @@ def _presenter_for(*, json_mode: bool) -> AnswerPresenter:
 
 
 def post_cancel(client: SignedClient, request_id: str) -> bool:
-    """Ask the center to cancel a request, returning whether it took.
+    """Ask the server to cancel a request, returning whether it took.
 
-    Cancellation is a real end-to-end action, not a local exit: the center marks
+    Cancellation is a real end-to-end action, not a local exit: the server marks
     the request and pushes ``attempt.cancel`` to the node running it, so the
     upstream call stops instead of billing to the end.
     """
@@ -2348,7 +2351,7 @@ def run_streaming_answer(
     no_node_grace_s: float,
     cancel_event: threading.Event,
 ) -> tuple[str, bool, list[str]]:
-    """Consume the center's event stream and present each increment as it arrives.
+    """Consume the server's event stream and present each increment as it arrives.
 
     How the pieces fit, and why:
 
@@ -2361,7 +2364,7 @@ def run_streaming_answer(
       neither text nor charge — which is exactly why the cursor has to be
       tracked here rather than inferred from what was printed.
     * Increments are admitted only from one attempt id (the first that produced
-      output). The center already refuses to store a superseded branch's
+      output). The server already refuses to store a superseded branch's
       deltas, so this is belt-and-braces against ever splicing two answers.
     * Ctrl-C sets the cancel flag; this loop then POSTs the cancel and keeps
       reading until the terminal frame, so the user sees the real end state
@@ -2462,10 +2465,10 @@ def run_streaming_answer(
                         break
                     continue
                 if stream.ended:
-                    # The connection died mid-answer, or the center closed a
+                    # The connection died mid-answer, or the server closed a
                     # live request's stream. Whatever was buffered locally is
                     # gone, but nothing is lost: every event is stored at the
-                    # center. Reconnecting from `cursor` replays only what has
+                    # server. Reconnecting from `cursor` replays only what has
                     # not been shown, which is what keeps the text from
                     # repeating and the charge from being taken twice.
                     dropped = True
@@ -2505,7 +2508,7 @@ def run_streaming_answer(
             break
         if dropped:
             # A die-off and a finished request look identical from here, so ask
-            # the center which it was. Only a *terminal* request may be drained
+            # the server which it was. Only a *terminal* request may be drained
             # with a plain read: reading a live request's events blocks until it
             # ends, which would quietly turn a stream back into a buffer and
             # stop showing increments. A live one is re-opened from the cursor
@@ -2523,7 +2526,7 @@ def run_streaming_answer(
             break
         if time.monotonic() >= deadline:
             break
-        # A short pause before reconnecting keeps a center that is refusing
+        # A short pause before reconnecting keeps a server that is refusing
         # connections from being hammered, while staying responsive.
         time.sleep(ASK_RECONNECT_PAUSE_S)
     return status, cancel_event.is_set(), answer_parts
@@ -2539,10 +2542,10 @@ def _report_ask_failure(
     exit status rather than raising: ``ask`` reports and exits 1, it does not
     propagate.
 
-    ``status_document`` is the request as the center sees it, when the caller
+    ``status_document`` is the request as the server sees it, when the caller
     could read one back. Its note is printed between the local error and the next
     step because the two are different facts: the error says how this wait ended,
-    the note says why the center had not finished.
+    the note says why the server had not finished.
     """
     guidance = ux.classify_failure(
         error_code=getattr(exc, "error_code", None),
@@ -2562,7 +2565,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
 
     Two delivery modes, chosen explicitly and never conflated:
 
-    * ``--stream`` asks the center for ``stream_strict`` and prints each
+    * ``--stream`` asks the server for ``stream_strict`` and prints each
       increment the moment its frame arrives.
     * otherwise the request is ``buffered_complete`` and the whole answer is
       printed once, after an explicit "waiting" notice.
@@ -2575,9 +2578,9 @@ def _cmd_ask(args: argparse.Namespace) -> int:
     Two things this command refuses to guess. Without ``--model`` the model is
     read off the online nodes rather than defaulted to a name baked into the
     client, and no request is created at all when there is no node to read one
-    from. And when the center ends a request in a failure state, its own
+    from. And when the server ends a request in a failure state, its own
     ``billing_note`` is printed: the reason a request failed lives at the
-    center, and hiding it behind "did not finish" is what makes a default-config
+    server, and hiding it behind "did not finish" is what makes a default-config
     mismatch look like a mysterious outage.
     """
     directory = _config_dir(args.config_dir)
@@ -2627,7 +2630,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         request_id, body = build_signed_request(
             config_document=config_document,
             key_document=key_document,
-            # One question is one user turn: the request model the center and the
+            # One question is one user turn: the request model the server and the
             # node speak is a conversation, never a flattened prompt string.
             messages=(user_message(args.question),),
             model=model,
@@ -2680,7 +2683,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         post_cancel(client, request_id)
         _record_error(directory, ux.guidance_for(ux.FailureKind.NO_NODES))
         print(f"{PROG}: {exc}", file=sys.stderr)
-        # The center may already have written down *why* nothing took the work —
+        # The server may already have written down *why* nothing took the work —
         # a node that declined on its local budget, say. Read it back rather
         # than leaving the user with only "no node".
         with contextlib.suppress(PotluckError):
@@ -2688,13 +2691,13 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         print(f"{PROG}: {ux.NO_NODES_NEXT_STEP}", file=sys.stderr)
         return 1
     except WaitDeadline as exc:
-        # The local wait closed; the work did not. The center may still be holding
+        # The local wait closed; the work did not. The server may still be holding
         # the request in its dispatch queue or running it on a node, so nothing is
         # cancelled here and `--resume` stays available. What the user is owed
-        # beyond the local explanation is the center's own reason for not having
+        # beyond the local explanation is the server's own reason for not having
         # finished, which for a queued request is the note naming the node that
         # declined and why — without it a wait that ends is indistinguishable from
-        # a center that said nothing.
+        # a server that said nothing.
         unfinished: dict[str, Any] | None = None
         with contextlib.suppress(PotluckError):
             unfinished = client.get(f"/v1/requests/{request_id}")
@@ -2713,7 +2716,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
     if final_status in TERMINAL_REQUEST_STATES:
         with contextlib.suppress(OSError):
             pending_path.unlink()
-    # Any request that did not succeed, not only a terminal one. A center that
+    # Any request that did not succeed, not only a terminal one. A server that
     # holds a dispatch queue leaves a request it could not place waiting rather
     # than ending it, and the reason it is waiting — which node declined, on what
     # local policy — is on that request's note. Printing the note only for FAILED
@@ -2723,7 +2726,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
     if cancelled:
         print(
             f"{PROG}: {ux.describe_request('CANCELLED')} "
-            "(asked the center to stop the in-flight work)",
+            "(asked the server to stop the in-flight work)",
             file=sys.stderr,
         )
         return EXIT_CANCELLED
@@ -2879,7 +2882,7 @@ def _collect_diagnostics(
         "protocol_version": PROTOCOL_VERSION,
         "config_dir": str(directory),
         "identity": {"present": False, "detail": "no local identity found"},
-        "center": {
+        "server": {
             "url": None,
             "reachable": False,
             "detail": "",
@@ -2902,16 +2905,16 @@ def _collect_diagnostics(
             "present": True,
             **{
                 field: config_document.get(field)
-                for field in ("center_url", "key_id", "subject_id", "tenant_id", "role")
+                for field in ("server_url", "key_id", "subject_id", "tenant_id", "role")
             },
         }
 
     if config_document is not None and key_document is not None:
-        url = str(config_document.get("center_url", ""))
-        report["center"]["url"] = url
+        url = str(config_document.get("server_url", ""))
+        report["server"]["url"] = url
         reachable, detail = probe_endpoint(url)
-        report["center"]["reachable"] = reachable
-        report["center"]["detail"] = detail
+        report["server"]["reachable"] = reachable
+        report["server"]["detail"] = detail
         if reachable:
             try:
                 signed_client_for(config_document, key_document).get("/v1/checkpoint")
@@ -2921,19 +2924,19 @@ def _collect_diagnostics(
                     http_status=getattr(exc, "http_status", None),
                     message=str(exc),
                 )
-                report["center"]["credential_valid"] = False
-                report["center"]["credential_detail"] = guidance.phrase
-                report["center"]["credential_code"] = str(guidance.kind)
-                report["center"]["credential_next_step"] = guidance.next_step
+                report["server"]["credential_valid"] = False
+                report["server"]["credential_detail"] = guidance.phrase
+                report["server"]["credential_code"] = str(guidance.kind)
+                report["server"]["credential_next_step"] = guidance.next_step
             else:
-                report["center"]["credential_valid"] = True
-                report["center"]["credential_detail"] = "credential valid"
+                report["server"]["credential_valid"] = True
+                report["server"]["credential_detail"] = "credential valid"
 
     report["node"] = _node_diagnostics(node_path, config_document, key_document)
     report["ok"] = bool(
         report["identity"]["present"]
-        and report["center"]["reachable"]
-        and report["center"]["credential_valid"] is not False
+        and report["server"]["reachable"]
+        and report["server"]["credential_valid"] is not False
     )
     return report
 
@@ -2952,20 +2955,20 @@ def _print_doctor_report(report: dict[str, Any]) -> None:
         )
     else:
         print(f"  identity: not joined ({identity.get('detail')})")
-    center = report["center"]
-    if center.get("url") is None:
-        print("  center: not configured")
-    elif center["credential_valid"] is False:
-        print(f"  center: {center['url']} reachable, but {center['credential_detail']}")
+    server = report["server"]
+    if server.get("url") is None:
+        print("  server: not configured")
+    elif server["credential_valid"] is False:
+        print(f"  server: {server['url']} reachable, but {server['credential_detail']}")
         # A state without a remedy is just a nicer error: the recovery command
         # belongs on the same screen as the failure it fixes.
-        next_step = center.get("credential_next_step")
+        next_step = server.get("credential_next_step")
         if next_step:
             print(f"    {next_step}")
-    elif center["credential_valid"] is True:
-        print(f"  center: {center['url']} reachable, credential valid")
+    elif server["credential_valid"] is True:
+        print(f"  server: {server['url']} reachable, credential valid")
     else:
-        print(f"  center: {center['url']} unreachable ({center['detail']})")
+        print(f"  server: {server['url']} unreachable ({server['detail']})")
     node = report["node"]
     if node is None:
         print("  node: not configured")
@@ -2975,7 +2978,7 @@ def _print_doctor_report(report: dict[str, Any]) -> None:
         config = node["config"]
         upstream = config.get("upstream", {})
         state = (
-            "connected to the center" if node.get("connected") else "not connected to the center"
+            "connected to the server" if node.get("connected") else "not connected to the server"
         )
         sharing = "sharing enabled" if config.get("share_enabled") else "sharing paused"
         print(
@@ -3021,11 +3024,11 @@ def _node_config_path(args: argparse.Namespace) -> Path:
 
 
 def _run_node_forever(node_path: Path) -> int:
-    """Load a node config, check its upstream, and hold the center link.
+    """Load a node config, check its upstream, and hold the server link.
 
     Shared by ``connect`` and ``share run`` so both paths enforce the same
     pre-dial upstream check: a node whose egress is blocked should learn that
-    before the center dispatches work to it and every attempt fails.
+    before the server dispatches work to it and every attempt fails.
     """
     node_config, adapter = load_node(node_path)
     if isinstance(adapter, HttpUpstreamAdapter):
@@ -3044,7 +3047,7 @@ def _run_node_forever(node_path: Path) -> int:
     try:
         print(
             f"{PROG}: node {node_config.node_id} connecting to "
-            f"{node_config.center_url}: {summary}"
+            f"{node_config.server_url}: {summary}"
         )
         connector.run_forever(stop_event=stop)
     finally:
@@ -3087,7 +3090,7 @@ def _cmd_share_pause(args: argparse.Namespace) -> int:
     _set_share_switch(path, enabled=False)
     print(f"{PROG}: sharing paused: wrote share_enabled=false to {path}")
     print(
-        f"{PROG}: a running `potluck share run` syncs the pause to the center within one "
+        f"{PROG}: a running `potluck share run` syncs the pause to the server within one "
         "poll cycle (1 second by default); in-flight work finishes normally"
     )
     return 0
@@ -3099,7 +3102,7 @@ def _cmd_share_resume(args: argparse.Namespace) -> int:
     _set_share_switch(path, enabled=True)
     print(f"{PROG}: sharing resumed: wrote share_enabled=true to {path}")
     print(
-        f"{PROG}: a running `potluck share run` takes work from the center again within "
+        f"{PROG}: a running `potluck share run` takes work from the server again within "
         "one poll cycle (1 second by default)"
     )
     return 0
@@ -3125,7 +3128,7 @@ def _cmd_share_status(args: argparse.Namespace) -> int:
             if isinstance(adapter, HttpUpstreamAdapter)
             else {"adapter": adapter.name, "model": adapter.model}
         ),
-        "center_url": node_config.center_url,
+        "server_url": node_config.server_url,
     }
     if args.json_output:
         print(canonicalize(section).decode("utf-8"))
@@ -3143,7 +3146,7 @@ def _cmd_share_status(args: argparse.Namespace) -> int:
         f"  upstream: {upstream.get('host')}{upstream.get('path') or ''} "
         f"({upstream.get('model')})"
     )
-    print(f"  center: {section['center_url']}")
+    print(f"  server: {section['server_url']}")
     return 0
 
 
@@ -3202,7 +3205,7 @@ def _resolve_node_token(directory: Path, token_file: Path | None) -> str:
     Sources, in order:
 
     1. ``--node-token-file`` / ``AIPOTLUCK_NODE_TOKEN``. This is the *override*
-       path for an operator who pre-registered a credential in the center's
+       path for an operator who pre-registered a credential in the server's
        ``credentials[]`` by hand (the legacy route the runbook still documents).
        An explicit instruction outranks state on disk, or the override could
        never override anything.
@@ -3228,8 +3231,8 @@ def _resolve_node_token(directory: Path, token_file: Path | None) -> str:
     if not sys.stdin.isatty():
         raise PotluckError(
             "missing the platform node token and this is not an interactive terminal: "
-            f"run `{PROG} join --node --center <center url> --invite <code>` to have the "
-            "center issue and save the token (the invite path needs no hand-copied token), "
+            f"run `{PROG} join --node --server <server url> --invite <code>` to have the "
+            "server issue and save the token (the invite path needs no hand-copied token), "
             "or supply a token the operator pre-registered with --node-token-file / "
             f"{NODE_TOKEN_ENV}; the recovery path for a lost token is an operator "
             f"`{PROG} admin revoke-key` followed by re-joining on a fresh invite"
@@ -3237,15 +3240,15 @@ def _resolve_node_token(directory: Path, token_file: Path | None) -> str:
     return _prompt_for("platform node token (not echoed)", secret=True)
 
 
-def _ws_center_url(center_url: str) -> str:
-    """Return the node-link WebSocket URL for an http(s) center URL.
+def _ws_server_url(server_url: str) -> str:
+    """Return the node-link WebSocket URL for an http(s) server URL.
 
     Raises:
         PotluckError: If the URL is not http or https.
     """
-    parts = urlsplit(center_url)
+    parts = urlsplit(server_url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise PotluckError(f"center URL must be http or https, not {center_url!r}")
+        raise PotluckError(f"server URL must be http or https, not {server_url!r}")
     scheme = "wss" if parts.scheme == "https" else "ws"
     port = parts.port or (443 if parts.scheme == "https" else 80)
     return f"{scheme}://{parts.hostname}:{port}/v1/node-link"
@@ -3276,7 +3279,7 @@ def _write_node_config(
     if not all(isinstance(value, str) and value for value in device_ids):
         raise PotluckError(
             "this identity has no device binding; join with a node invite "
-            f"(`{PROG} join --node --center <url> --invite <code>`) first"
+            f"(`{PROG} join --node --server <url> --invite <code>`) first"
         )
     device_private_key = key_document.get("device_private_key_b64")
     if not isinstance(device_private_key, str) or not device_private_key:
@@ -3285,7 +3288,7 @@ def _write_node_config(
             f"`{PROG} join --node` to generate one"
         )
     document: dict[str, Any] = {
-        "center_url": _ws_center_url(str(identity_config["center_url"])),
+        "server_url": _ws_server_url(str(identity_config["server_url"])),
         "node_id": str(device_id),
         "device_id": str(device_id),
         "device_key_id": str(device_key_id),
@@ -3405,15 +3408,15 @@ def _contributor_self_check(
     else:
         print(f"{PROG}:   the local upstream is {adapter.name}; no network probe needed")
 
-    print(f"{PROG}: self-check 3/3 center reachability")
-    center_url = str(identity_config["center_url"])
-    center_reachable, center_detail = probe_endpoint(center_url)
-    if center_reachable:
-        print(f"{PROG}:   center reachable: {center_detail}")
+    print(f"{PROG}: self-check 3/3 server reachability")
+    server_url = str(identity_config["server_url"])
+    server_reachable, server_detail = probe_endpoint(server_url)
+    if server_reachable:
+        print(f"{PROG}:   server reachable: {server_detail}")
     else:
         ok = False
-        guidance = ux.CENTER_UNREACHABLE_GUIDANCE
-        print(f"{PROG}:   center unreachable: {center_detail}", file=sys.stderr)
+        guidance = ux.SERVER_UNREACHABLE_GUIDANCE
+        print(f"{PROG}:   server unreachable: {server_detail}", file=sys.stderr)
         print(f"{PROG}:   {guidance.next_step}", file=sys.stderr)
     print(
         f"{PROG}: self-check result: "
@@ -3430,7 +3433,7 @@ def _run_contributor_wizard(
 
     Step 1 collects the upstream address/key/model and writes them into
     ``node.json`` (0600). Step 2 checks configuration completeness, upstream
-    reachability, and center reachability, and prints a plain conclusion for
+    reachability, and server reachability, and prints a plain conclusion for
     each. Step 3 either starts sharing (``--start``) or prints the exact
     command, because silently turning an onboarding command into a long-running
     foreground process is a surprise, not a convenience.
@@ -3439,7 +3442,7 @@ def _run_contributor_wizard(
     a terminal) and are never placed on a command line, echoed, or uploaded. The
     platform token additionally has the invite path: :func:`_resolve_node_token`
     falls back to the one ``join --node`` saved, so a contributor who arrived by
-    invite is never asked for a credential the center already issued them.
+    invite is never asked for a credential the server already issued them.
     """
     node_path = directory / _NODE_FILE
     print(f"{PROG}: contributor onboarding wizard (config dir {directory})")
@@ -3608,8 +3611,8 @@ def _cmd_contribute_import_config(args: argparse.Namespace) -> int:
 #: five dimensions are assessable, while the HTTP path holds three documents and
 #: `metering_provenance` stays `unknown`.
 _SOURCE_LABELS = {
-    "center-store": "the center's own store",
-    "center-http": "center HTTP",
+    "server-store": "the server's own store",
+    "server-http": "server HTTP",
 }
 
 
@@ -3656,18 +3659,18 @@ def _verify_receipt_as_consumer(directory: Path, receipt_id: str) -> ReceiptVeri
 
     All three reads go through the `SignedClient` the joined identity already
     authenticates with, so this command needs no token and prints none. The
-    account history endpoint takes no account id: the center derives the account
+    account history endpoint takes no account id: the server derives the account
     from the credential, which is what stops this command reading anybody else's
     books even by accident.
 
     Raises:
-        PotluckError: If no identity is saved here, the center refuses a read, or
+        PotluckError: If no identity is saved here, the server refuses a read, or
             an answer cannot be parsed.
     """
     config_document, key_document = load_joined_identity(directory)
     client = signed_client_for(config_document, key_document)
     receipt_document = client.get(f"/v1/receipts/{quote(receipt_id, safe='')}")
-    return verify_receipt_from_center(
+    return verify_receipt_from_server(
         receipt_document=receipt_document,
         checkpoint_document=client.get("/v1/checkpoint"),
         history_document=client.get("/v1/account/history"),
@@ -3678,7 +3681,7 @@ def _cmd_verify_receipt(args: argparse.Namespace) -> int:
     """Run ``verify receipt``: the five-dimension check over one receipt.
 
     The consumer view reads over HTTP under the joined identity, so
-    ``--config-dir`` is required; the operator view that opens a center's own
+    ``--config-dir`` is required; the operator view that opens a server's own
     store is ``potluck-server verify receipt``.
 
     Returns:
@@ -3691,7 +3694,7 @@ def _cmd_verify_receipt(args: argparse.Namespace) -> int:
     if directory is None:
         print(
             f"{PROG}: error: --config-dir is required; the consumer view reads over "
-            "HTTP as the joined identity (the operator view that reads a center's "
+            "HTTP as the joined identity (the operator view that reads a server's "
             "own store is `potluck-server verify receipt --config`)",
             file=sys.stderr,
         )
@@ -3727,11 +3730,11 @@ def print_differences(
         print(f"  {item.subject} | {item.local} | {item.remote} | {item.kind}")
 
 
-def _http_center_url(center_url: str) -> str:
-    """Return the HTTP base URL of the center a node configuration's URL names.
+def _http_server_url(server_url: str) -> str:
+    """Return the HTTP base URL of the server a node configuration's URL names.
 
     ``node.json`` stores the WebSocket URL the connector dials, which is the
-    inverse of `_ws_center_url`. Reconciliation reads a plain HTTP endpoint with
+    inverse of `_ws_server_url`. Reconciliation reads a plain HTTP endpoint with
     the same credential, so the scheme is mapped back and the path dropped:
     carrying ``/v1/node-link`` into an HTTP GET would ask the gateway to upgrade
     a connection that is not a WebSocket.
@@ -3739,20 +3742,20 @@ def _http_center_url(center_url: str) -> str:
     Raises:
         PotluckError: If the URL is not an absolute ``ws(s)://`` URL.
     """
-    parts = urlsplit(center_url)
+    parts = urlsplit(server_url)
     if parts.scheme not in ("ws", "wss") or not parts.hostname:
-        raise PotluckError(f"node center URL must be ws or wss, not {center_url!r}")
+        raise PotluckError(f"node server URL must be ws or wss, not {server_url!r}")
     scheme = "https" if parts.scheme == "wss" else "http"
     port = parts.port or (443 if parts.scheme == "wss" else "80")
     return f"{scheme}://{parts.hostname}:{port}"
 
 
 def _cmd_share_reconcile(args: argparse.Namespace) -> int:
-    """Run ``share reconcile``: this node's record against the center's claim.
+    """Run ``share reconcile``: this node's record against the server's claim.
 
     The local half is read straight out of ``node.db`` and the remote half from
     one read-only endpoint scoped to this node's own credential, so the command
-    sees exactly what the contributor and the center each hold about the same
+    sees exactly what the contributor and the server each hold about the same
     attempts. Neither side is written to, and neither database is created: a
     ``node.db`` that is missing is reported, since building an empty one would
     both hide the loss and hand `share run` a node with no history.
@@ -3769,7 +3772,7 @@ def _cmd_share_reconcile(args: argparse.Namespace) -> int:
         raise PotluckError(f"no node configuration at {path}; run `{PROG} share setup` first")
     node_config, _ = load_node(path)
     # The node's own database must be there: only `share run` creates one. Were
-    # it created here instead, the reconcile would report every center attempt as
+    # it created here instead, the reconcile would report every server attempt as
     # missing locally and leave behind an empty node.db that a later `share run`
     # would continue with as if this node had never executed anything.
     store = NodeStore.open_existing(node_config.database_path)
@@ -3782,7 +3785,7 @@ def _cmd_share_reconcile(args: argparse.Namespace) -> int:
     # The token travels only in the Authorization header; `bearer_get` scrubs it
     # from every message it raises, so a refused read cannot print it.
     document = bearer_get(
-        _http_center_url(node_config.center_url), node_config.token, "/v1/node/attempts"
+        _http_server_url(node_config.server_url), node_config.token, "/v1/node/attempts"
     )
     answered = document.get("node_ids")
     known = {
@@ -3802,16 +3805,16 @@ def _cmd_share_reconcile(args: argparse.Namespace) -> int:
     )
     if node_config.node_id not in known:
         # Not a difference between two records of one attempt, but the reason
-        # every attempt below is missing: the center does not know this node, so
-        # it listed nothing to compare against. Saying so first keeps "the center
-        # forgot my work" distinguishable from "I am pointing at the wrong center".
+        # every attempt below is missing: the server does not know this node, so
+        # it listed nothing to compare against. Saying so first keeps "the server
+        # forgot my work" distinguishable from "I am pointing at the wrong server".
         differences.insert(
             0,
             Difference(
                 subject=f"node {node_config.node_id}",
-                kind="center_does_not_know_this_node",
+                kind="server_does_not_know_this_node",
                 local=f"this machine dials as {node_config.node_id}",
-                remote=f"the center listed {sorted(known) or '<no node>'}",
+                remote=f"the server listed {sorted(known) or '<no node>'}",
             ),
         )
     if args.json_output:
@@ -3819,7 +3822,7 @@ def _cmd_share_reconcile(args: argparse.Namespace) -> int:
             canonicalize(
                 {
                     "node_id": node_config.node_id,
-                    "center_node_ids": sorted(known),
+                    "server_node_ids": sorted(known),
                     "executions": len(executions),
                     "remote_attempts": len(remote),
                     "differences": [item.to_payload() for item in differences],
@@ -3830,11 +3833,11 @@ def _cmd_share_reconcile(args: argparse.Namespace) -> int:
         print_differences(
             title=(
                 f"{PROG} share reconcile (node {node_config.node_id}, "
-                f"{len(executions)} local execution records, {len(remote)} center attempts)"
+                f"{len(executions)} local execution records, {len(remote)} server attempts)"
             ),
             differences=differences,
             left="local record",
-            right="center record",
+            right="server record",
         )
     return 1 if differences else 0
 

@@ -11,8 +11,8 @@ saved in the config directory, submits the caller's conversation *verbatim*,
 waits for the answer exactly the way ``potluck ask`` waits, and renders that
 answer back in the caller's own format. A tool therefore needs one ``base_url``
 and no potluck-specific code, and the signing key never leaves this machine.
-That last part is the difference from the center's own OpenAI-compatible
-surface, where the center holds bounded spending authority over a key it issued.
+That last part is the difference from the server's own OpenAI-compatible
+surface, where the server holds bounded spending authority over a key it issued.
 
 Threat model: loopback reachability *is* the model
 -------------------------------------------------
@@ -30,16 +30,16 @@ this endpoint reads is ever written into a response, a header, or a log line.
 Billing honesty
 ---------------
 An answer is rendered as a completion only for a request that reached
-``SUCCEEDED``. Everything else — a request the center ended in failure, one whose
+``SUCCEEDED``. Everything else — a request the server ended in failure, one whose
 wait window closed while it was still running, one cancelled because the caller
 hung up — is rendered as an error document that names the platform's request id,
-carries the center's own reason verbatim when it recorded one, and points at
+carries the server's own reason verbatim when it recorded one, and points at
 ``potluck verify receipt``. A token count is rendered only from what the platform
 reported: when it reported nothing the ``usage`` block is omitted, because zeros
 in a billing document read as "this was free".
 
 Graceful exit: ``SIGINT``/``SIGTERM`` stop the listener, set the cancel flag of
-every request in flight, and give those requests a short grace to tell the center
+every request in flight, and give those requests a short grace to tell the server
 to stop the work — so an interrupted endpoint does not leave an upstream
 generating tokens for an answer nobody will read.
 
@@ -103,7 +103,7 @@ DEFAULT_PORT: Final = 8787
 LOCAL_API_KEY_PLACEHOLDER: Final = "potluck-local-signing"
 
 #: How long a stop waits for in-flight requests to wind down after cancelling
-#: them. A cancel has to reach the center over the network, so this bounds the
+#: them. A cancel has to reach the server over the network, so this bounds the
 #: wait rather than promising an outcome: the listener is already closed, and
 #: what is being waited for is the cancel, not the answer.
 SHUTDOWN_GRACE_S: Final = 2.0
@@ -121,12 +121,12 @@ SERVED_ROUTES: Final = (
     "POST /v1/messages",
 )
 
-#: The center's own refusal codes as this endpoint's HTTP status and error code.
+#: The server's own refusal codes as this endpoint's HTTP status and error code.
 #: A code with no entry answers ``502 upstream_failed``: the platform refused the
 #: work and this endpoint cannot say more precisely why than the message it
 #: forwards. Mapped by code rather than by HTTP status because the code is the
-#: center's claim about *why*, and a status is a coarse class.
-_CENTER_REFUSALS: Final[dict[str, tuple[int, str]]] = {
+#: server's claim about *why*, and a status is a coarse class.
+_SERVER_REFUSALS: Final[dict[str, tuple[int, str]]] = {
     "insufficient_funds": (429, "insufficient_quota"),
     "forbidden": (401, "invalid_api_key"),
     "unauthorized": (401, "invalid_api_key"),
@@ -198,7 +198,7 @@ class LocalIdentity:
         config_dir: Where the identity lives, named in the verify guidance.
         config_document: The saved ``config.json``.
         key_document: The saved ``key.json``; never rendered.
-        client: The signed consumer for the center this identity joined.
+        client: The signed consumer for the server this identity joined.
     """
 
     config_dir: Path
@@ -525,8 +525,8 @@ class StreamingSink:
 class _InFlight:
     """The requests one running endpoint has open, so a stop can cancel them.
 
-    A cancel is posted to the center rather than merely abandoned locally: the
-    center pushes it on to the node running the work, so the upstream call stops
+    A cancel is posted to the server rather than merely abandoned locally: the
+    server pushes it on to the node running the work, so the upstream call stops
     instead of billing to its end for an answer nobody will read.
     """
 
@@ -602,10 +602,10 @@ class LocalEndpointServer:
         self.in_flight = _InFlight()
         #: The session every request this endpoint signs is attributed to. One per
         #: endpoint process, minted here rather than per request: an agent loop
-        #: driven through this endpoint *is* one session, and the center
+        #: driven through this endpoint *is* one session, and the server
         #: aggregates a session's turns and prefers the node that served its last
         #: one. A caller that wants its own session boundaries talks to the
-        #: center directly instead of through this loopback convenience.
+        #: server directly instead of through this loopback convenience.
         self.session_id = new_session_id()
         self._thread: threading.Thread | None = None
         try:
@@ -691,7 +691,7 @@ class LocalEndpointServer:
             self._thread = None
         if cancelled and not self.in_flight.wait_quiet(grace_s):
             print(
-                f"{PROG} serve-openai: asked the center to cancel {cancelled} in-flight "
+                f"{PROG} serve-openai: asked the server to cancel {cancelled} in-flight "
                 f"request(s); {self.in_flight.pending} did not report back within "
                 f"{grace_s:g}s and may still be settling there",
                 flush=True,
@@ -702,7 +702,7 @@ class LocalEndpointServer:
         """Serve until `stop` is set, then shut down gracefully.
 
         The shutdown runs even when the wait is interrupted, so an endpoint that
-        dies mid-run still closes its listener and asks the center to stop the
+        dies mid-run still closes its listener and asks the server to stop the
         work it had in flight.
 
         Args:
@@ -868,7 +868,7 @@ def _handler_class(
             try:
                 document = identity.client.get("/v1/nodes")
             except PotluckError as exc:
-                self._refuse(502, "upstream_failed", _center_failure_message(exc))
+                self._refuse(502, "upstream_failed", _server_failure_message(exc))
                 return
             nodes = document.get("nodes")
             models = openai_wire.aggregate_models(nodes if isinstance(nodes, list) else [])
@@ -972,7 +972,7 @@ def _handler_class(
             finally:
                 if cancel.is_set():
                     # Posted even when the wait loop already posted one: a cancel
-                    # the center has applied is refused and ignored, and the
+                    # the server has applied is refused and ignored, and the
                     # buffered loop does not post one at all.
                     post_cancel(identity.client, request_id)
                 self._cancel = None
@@ -994,8 +994,8 @@ def _handler_class(
                 submitted = identity.client.post("/v1/requests", body)
             except PotluckError as exc:
                 self._refuse(
-                    *_center_refusal(exc),
-                    _center_failure_message(exc, request_id=request_id),
+                    *_server_refusal(exc),
+                    _server_failure_message(exc, request_id=request_id),
                     request_id=request_id,
                     anthropic=anthropic,
                 )
@@ -1034,7 +1034,7 @@ def _handler_class(
                 # unfinished. Answered as a deadline rather than as an upstream
                 # failure, and with the billing-honest message: nothing was
                 # delivered, the charge is not knowable from here, and the
-                # request may still settle at the center.
+                # request may still settle at the server.
                 del exc  # `_unfinished_message` states the deadline itself
                 self._fail_completion(
                     shape,
@@ -1078,12 +1078,12 @@ def _handler_class(
                         receipt_id=None,
                     )
                     return
-                status_code, code = _center_refusal(exc)
+                status_code, code = _server_refusal(exc)
                 self._fail_completion(
                     shape,
                     status_code,
                     code,
-                    _center_failure_message(exc, request_id=request_id),
+                    _server_failure_message(exc, request_id=request_id),
                     request_id,
                     receipt_id=None,
                 )
@@ -1101,11 +1101,11 @@ def _handler_class(
             """Render the answer for a wait that returned rather than raised.
 
             Returning is not the same as succeeding: the wait loops also return for
-            a request the center ended in failure, and the status document — not
+            a request the server ended in failure, and the status document — not
             the fact that a loop finished — decides whether this is a completion or
             an error.
 
-            The status and the token split are read back from the center rather
+            The status and the token split are read back from the server rather
             than taken from the wait loop, which is one extra round trip per
             request and the price of not reimplementing the loop here: the books
             are the authority on what a request cost.
@@ -1170,7 +1170,7 @@ def _handler_class(
 
             A disconnect is not an error to answer — there is nobody to answer —
             but it is a reason to stop the work, so the cancel flag of this
-            request is set and the wait loop asks the center to stop it: an
+            request is set and the wait loop asks the server to stop it: an
             upstream must not keep generating tokens for an answer nobody is
             left to read.
 
@@ -1382,7 +1382,7 @@ def _final_facts(
 ) -> tuple[dict[str, Any], dict[str, int] | None]:
     """Return a request's terminal status document and its reported token split.
 
-    Both reads are best-effort. The wait has already ended, so a center that will
+    Both reads are best-effort. The wait has already ended, so a server that will
     not answer a follow-up read must not turn a delivered answer into an error: an
     empty document renders as "not SUCCEEDED" and the caller is given the request
     id to check, which is the honest answer when this endpoint cannot read the
@@ -1413,7 +1413,7 @@ def _receipt_id(document: Mapping[str, Any]) -> str | None:
 
 
 def _billing_note(document: Mapping[str, Any]) -> str | None:
-    """Return the center's own reason for a request that did not succeed."""
+    """Return the server's own reason for a request that did not succeed."""
     note = document.get("billing_note")
     return note if isinstance(note, str) and note else None
 
@@ -1421,16 +1421,16 @@ def _billing_note(document: Mapping[str, Any]) -> str | None:
 def _failure_answer(status: str) -> tuple[int, str]:
     """Return the HTTP status and error code for a request that produced no answer.
 
-    Two cases, told apart by whether the center finished the request:
+    Two cases, told apart by whether the server finished the request:
 
     * a status that is *not* terminal — including an empty one, which is what a
-      center that would not answer a follow-up read leaves here — means this
+      server that would not answer a follow-up read leaves here — means this
       endpoint stopped waiting while the work was still unfinished. That is a
       deadline: ``504``, because the request may still be running and may still
       be billed, and reporting it as an upstream failure would claim the
       platform ended it.
     * a terminal non-success means the platform ended the request. ``EXPIRED``
-      is the center's own deadline and answers ``504``; ``FAILED`` and
+      is the server's own deadline and answers ``504``; ``FAILED`` and
       ``CANCELLED`` answer ``502``, which is what "the platform did not deliver
       this" means to a caller.
     """
@@ -1441,22 +1441,22 @@ def _failure_answer(status: str) -> tuple[int, str]:
     return 502, "upstream_failed"
 
 
-def _center_refusal(exc: PotluckError) -> tuple[int, str]:
-    """Map a center refusal onto this endpoint's HTTP status and error code."""
+def _server_refusal(exc: PotluckError) -> tuple[int, str]:
+    """Map a server refusal onto this endpoint's HTTP status and error code."""
     code = getattr(exc, "error_code", None)
-    if isinstance(code, str) and code in _CENTER_REFUSALS:
-        return _CENTER_REFUSALS[code]
+    if isinstance(code, str) and code in _SERVER_REFUSALS:
+        return _SERVER_REFUSALS[code]
     http_status = getattr(exc, "http_status", None)
     if isinstance(http_status, int) and http_status in (401, 402, 403, 404, 429):
         return http_status, "invalid_request"
     return 502, "upstream_failed"
 
 
-def _center_failure_message(exc: PotluckError, *, request_id: str = "") -> str:
+def _server_failure_message(exc: PotluckError, *, request_id: str = "") -> str:
     """Explain a failure of the platform itself, with the remedy the CLI gives.
 
-    The center's own wording is carried through rather than replaced: the reason a
-    request failed lives at the center, and hiding it behind "upstream failure" is
+    The server's own wording is carried through rather than replaced: the reason a
+    request failed lives at the server, and hiding it behind "upstream failure" is
     what makes an exhausted credit balance look like an outage. The next step is
     the one :mod:`aipotluck.ux` already classifies this failure into, so this
     endpoint and ``ask`` cannot drift apart about what to do next.
@@ -1485,7 +1485,7 @@ def _unfinished_message(
     caller cannot work out for itself: that the work may still be running and may
     still be billed, that the amount is not knowable from here, and where to check
     — the receipt when one was issued, and the request id always, because that is
-    what the center's own books answer against. A generic "upstream error" would
+    what the server's own books answer against. A generic "upstream error" would
     leave a caller believing either "this was free" or "this definitely ran", and
     neither is knowable from here.
     """
@@ -1500,12 +1500,12 @@ def _unfinished_message(
     else:
         check = (
             f"no receipt was issued for it; quote request {request_id} to the "
-            "center's operator to have the charge confirmed"
+            "server's operator to have the charge confirmed"
         )
     return (
         f"request {request_id} {phrase}{note}{window}. No answer was delivered and the "
         f"charge is not knowable from here: {ux.UNCERTAIN_USAGE_PHRASE}. The work may "
-        f"still be running at the center and is billed only if it settles; {check}."
+        f"still be running at the server and is billed only if it settles; {check}."
     )
 
 
@@ -1576,7 +1576,7 @@ def serve_openai(
     )
     print(
         f"{PROG} serve-openai: every request this run signs belongs to session "
-        f"{server.session_id}; the center aggregates it, so "
+        f"{server.session_id}; the server aggregates it, so "
         f"`potluck-server admin session-show --session {server.session_id}` reads "
         f"this run's turns, tokens and cost",
         flush=True,
@@ -1600,7 +1600,7 @@ def serve_openai(
             server.stop()
     if cancelled:
         print(
-            f"{PROG} serve-openai: stopped; asked the center to cancel "
+            f"{PROG} serve-openai: stopped; asked the server to cancel "
             f"{cancelled} in-flight request(s)",
             flush=True,
         )

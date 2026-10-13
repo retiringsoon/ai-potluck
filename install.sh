@@ -168,4 +168,4 @@ case ":$PATH:" in
     *":$BIN:"*) : ;;
     *) printf 'add it to PATH for this shell:\n  export PATH="%s:$PATH"\n' "$BIN" ;;
 esac
-printf 'next: potluck join --center <url> --invite <code>\n'
+printf 'next: potluck join --server <url> --invite <code>\n'

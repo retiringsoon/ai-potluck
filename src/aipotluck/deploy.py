@@ -9,7 +9,7 @@ because a config that only mostly parses is a config an operator cannot audit.
 ``node.json`` — one contribution node process::
 
     {
-      "center_url": "wss://center.example/v1/node-link",
+      "server_url": "wss://server.example/v1/node-link",
       "node_id": "node-A", "device_id": "device-A",
       "device_key_id": "device-key-A", "provider_id": "provider-A",
       "database_path": "node.db", "token": "...",
@@ -24,9 +24,9 @@ because a config that only mostly parses is a config an operator cannot audit.
 
 ``consumer.json`` — one consumer's connection settings::
 
-    {"center_url": "https://center.example", "token": "..."}
+    {"server_url": "https://server.example", "token": "..."}
 
-The center's own configuration (``center.json``), its provisioning and its
+The server's own configuration (``server.json``), its provisioning and its
 inspection handles live in ``ai-potluck-server``; the shared config-parsing
 helpers below are public because that package builds on them.
 
@@ -51,10 +51,10 @@ import secrets
 import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit
 
 from aipotluck.proxy import http_connection_for
@@ -330,6 +330,31 @@ def load_document(path: Path) -> dict[str, Any]:
     return cast("dict[str, Any]", parsed)
 
 
+#: Configuration keys a pre-rename file may still carry, each mapped to the key
+#: that replaced it. The rename is forward-only, so no loader reads both
+#: spellings: a stale file is refused with the replacement named, rather than
+#: reported as a missing field the operator has no way to act on.
+RENAMED_CONFIG_KEYS: Final = {"center_url": "server_url"}
+
+
+def reject_renamed_keys(document: Mapping[str, Any], context: str) -> None:
+    """Refuse a configuration document that still carries a renamed key.
+
+    Args:
+        document: The parsed configuration document.
+        context: The file description the error message is prefixed with.
+
+    Raises:
+        DeploymentError: Naming the stale key and the key that replaced it.
+    """
+    for old_key, new_key in RENAMED_CONFIG_KEYS.items():
+        if old_key in document:
+            raise DeploymentError(
+                f"{context}: field {old_key!r} was renamed to {new_key!r}; "
+                f"update your config to use {new_key!r}"
+            )
+
+
 def _field(document: dict[str, Any], key: str, context: str) -> Any:
     """Return a required field's raw value.
 
@@ -569,14 +594,16 @@ def load_node(path: str | Path) -> tuple[ConnectorConfig, Adapter]:
         The connector configuration and the configured adapter.
 
     Raises:
-        DeploymentError: On any malformed field, a non-``ws(s)://`` center
-            URL, or a refused adapter block.
+        DeploymentError: On any malformed field, a non-``ws(s)://`` server
+            URL, a key listed in ``RENAMED_CONFIG_KEYS``, or a refused adapter
+            block.
     """
     config_path = Path(path)
     context = f"node configuration {config_path}"
     document = load_document(config_path)
-    center_url = require_str(document, "center_url", context)
-    absolute_url(center_url, what="'center_url'", schemes=("ws", "wss"), context=context)
+    reject_renamed_keys(document, context)
+    server_url = require_str(document, "server_url", context)
+    absolute_url(server_url, what="'server_url'", schemes=("ws", "wss"), context=context)
     node_id = require_str(document, "node_id", context)
     device_id = require_str(document, "device_id", context)
     device_key_id = require_str(document, "device_key_id", context)
@@ -595,7 +622,7 @@ def load_node(path: str | Path) -> tuple[ConnectorConfig, Adapter]:
         )
     adapter = _load_adapter(document, context)
     config = ConnectorConfig(
-        center_url=center_url,
+        server_url=server_url,
         node_id=node_id,
         device_id=device_id,
         device_key_id=device_key_id,
@@ -637,27 +664,29 @@ def load_consumer(path: str | Path) -> dict[str, str]:
     """Load consumer connection settings.
 
     Args:
-        path: The ``consumer.json`` file, holding ``center_url`` (http or
+        path: The ``consumer.json`` file, holding ``server_url`` (http or
             https) and the consumer ``token``.
 
     Returns:
-        ``{"center_url": ..., "token": ...}``. No ``redacted()`` summary
+        ``{"server_url": ..., "token": ...}``. No ``redacted()`` summary
         exists for this mapping on purpose: it *is* the secret's only carrier,
         it is never printed, and every diagnostic goes through
         `consumer_get`/`consumer_post`, which scrub the token from anything
         they raise.
 
     Raises:
-        DeploymentError: If the file is malformed or the URL is not an
-            absolute ``http(s)://`` URL.
+        DeploymentError: If the file is malformed, carries a key listed in
+            ``RENAMED_CONFIG_KEYS``, or the URL is not an absolute
+            ``http(s)://`` URL.
     """
     config_path = Path(path)
     context = f"consumer configuration {config_path}"
     document = load_document(config_path)
-    center_url = require_str(document, "center_url", context)
-    absolute_url(center_url, what="'center_url'", schemes=("http", "https"), context=context)
+    reject_renamed_keys(document, context)
+    server_url = require_str(document, "server_url", context)
+    absolute_url(server_url, what="'server_url'", schemes=("http", "https"), context=context)
     token = require_str(document, "token", context)
-    return {"center_url": center_url, "token": token}
+    return {"server_url": server_url, "token": token}
 
 
 # --------------------------------------------------------------------------
@@ -674,17 +703,17 @@ def _scrub_token(text: str, token: str) -> str:
 
 
 def _consumer_parts(consumer: dict[str, str]) -> tuple[Any, str, int]:
-    """Split a consumer's center URL into connection parts.
+    """Split a consumer's server URL into connection parts.
 
     Raises:
         DeploymentError: If the URL is not an absolute http(s) URL. (Config
             already validated it; the guard keeps a hand-built mapping honest.)
     """
-    parts = urlsplit(consumer["center_url"])
+    parts = urlsplit(consumer["server_url"])
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise DeploymentError(
-            f"center_url must be an absolute http:// or https:// URL, "
-            f"not {consumer['center_url']!r}"
+            f"server_url must be an absolute http:// or https:// URL, "
+            f"not {consumer['server_url']!r}"
         )
     port = parts.port or (443 if parts.scheme == "https" else 80)
     return parts.scheme, str(parts.hostname), port
@@ -737,7 +766,7 @@ def _http_failure(
 def _consumer_request(
     consumer: dict[str, str], method: str, path: str, body: dict[str, Any] | None
 ) -> dict[str, Any]:
-    """Run one authenticated consumer round trip against the center.
+    """Run one authenticated consumer round trip against the server.
 
     The request body is sent in canonical form, so a client-side bug cannot
     put a float on the wire the gateway would refuse anyway. The token is sent
@@ -764,7 +793,7 @@ def _consumer_request(
         raw = response.read()
     except OSError as exc:
         raise DeploymentError(
-            f"{method} {path} could not reach the center at {host}:{port}: {exc}"
+            f"{method} {path} could not reach the server at {host}:{port}: {exc}"
         ) from exc
     finally:
         connection.close()
@@ -783,8 +812,8 @@ def _consumer_request(
     return cast("dict[str, Any]", parsed)
 
 
-def bearer_get(center_url: str, token: str, path: str) -> dict[str, Any]:
-    """Authenticated ``GET`` against a center, raising on non-2xx.
+def bearer_get(server_url: str, token: str, path: str) -> dict[str, Any]:
+    """Authenticated ``GET`` against a server, raising on non-2xx.
 
     This is the role-agnostic form of `consumer_get`. A contribution node holds a
     platform token exactly as a provisioned consumer does, and the read-only
@@ -793,22 +822,22 @@ def bearer_get(center_url: str, token: str, path: str) -> dict[str, Any]:
     each growing its own.
 
     Args:
-        center_url: Absolute ``http(s)://`` URL of the center.
+        server_url: Absolute ``http(s)://`` URL of the server.
         token: The bearer credential. It is sent only in the header and is
             scrubbed from every raised message.
         path: The endpoint path, e.g. ``/v1/node/attempts``.
 
     Returns:
-        The parsed JSON object the center answered with.
+        The parsed JSON object the server answered with.
 
     Raises:
         DeploymentError: On any transport or HTTP failure.
     """
-    return _consumer_request({"center_url": center_url, "token": token}, "GET", path, None)
+    return _consumer_request({"server_url": server_url, "token": token}, "GET", path, None)
 
 
 def consumer_get(consumer: dict[str, str], path: str) -> dict[str, Any]:
-    """Authenticated ``GET`` against the center, raising on non-2xx.
+    """Authenticated ``GET`` against the server, raising on non-2xx.
 
     The error message carries the server's error body with the caller's token
     scrubbed; the token is never logged, because nothing here logs at all.
@@ -816,11 +845,11 @@ def consumer_get(consumer: dict[str, str], path: str) -> dict[str, Any]:
     Raises:
         DeploymentError: On any transport or HTTP failure.
     """
-    return bearer_get(consumer["center_url"], consumer["token"], path)
+    return bearer_get(consumer["server_url"], consumer["token"], path)
 
 
 def consumer_post(consumer: dict[str, str], path: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Authenticated canonical-JSON ``POST`` against the center.
+    """Authenticated canonical-JSON ``POST`` against the server.
 
     Raises:
         DeploymentError: On any transport or HTTP failure, with the server's
@@ -902,7 +931,7 @@ class SignedClient:
     This is the client half of the per-request signature: it holds the private
     key a joiner generated and signs each request's canonical payload — method,
     path, query, body digest, key id, timestamp and a fresh nonce — so the
-    center can resolve the identity from the registry rather than a
+    server can resolve the identity from the registry rather than a
     pre-provisioned token. It is deliberately separate from the bearer `consumer_*`
     helpers: those carry a token, this carries a key.
 
@@ -911,7 +940,7 @@ class SignedClient:
     helpers scrub their token.
     """
 
-    center_url: str
+    server_url: str
     key_id: str
     private_key_b64: str
 
@@ -948,7 +977,7 @@ class SignedClient:
         header = format_request_auth_header(
             key_id=self.key_id, issued_at=issued_at, nonce=nonce, signature_b64=signature
         )
-        scheme, host, port = _consumer_parts({"center_url": self.center_url})
+        scheme, host, port = _consumer_parts({"server_url": self.server_url})
         target = f"{path}?{query}" if query else path
         headers = {
             "authorization": f"{REQUEST_AUTH_SCHEME} {header}",
@@ -967,7 +996,7 @@ class SignedClient:
             raw = response.read()
         except OSError as exc:
             raise DeploymentError(
-                f"{method} {target} could not reach the center at {host}:{port}: {exc}"
+                f"{method} {target} could not reach the server at {host}:{port}: {exc}"
             ) from exc
         finally:
             connection.close()
@@ -986,11 +1015,11 @@ class SignedClient:
         return cast("dict[str, Any]", parsed)
 
     def get(self, path: str, *, query: str = "") -> dict[str, Any]:
-        """Signed ``GET`` against the center."""
+        """Signed ``GET`` against the server."""
         return self.request("GET", path, query=query)
 
     def post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        """Signed canonical-JSON ``POST`` against the center."""
+        """Signed canonical-JSON ``POST`` against the server."""
         return self.request("POST", path, body=body)
 
     def _open_event_response(
@@ -1025,7 +1054,7 @@ class SignedClient:
         header = format_request_auth_header(
             key_id=self.key_id, issued_at=issued_at, nonce=nonce, signature_b64=signature
         )
-        scheme, host, port = _consumer_parts({"center_url": self.center_url})
+        scheme, host, port = _consumer_parts({"server_url": self.server_url})
         connection = http_connection_for(
             scheme, host, port, timeout_s=timeout_s,
             tls_context=client_ssl_context(),
@@ -1043,7 +1072,7 @@ class SignedClient:
         except OSError as exc:
             connection.close()
             raise DeploymentError(
-                f"could not reach the center for the event stream of request "
+                f"could not reach the server for the event stream of request "
                 f"{request_id}: {exc}"
             ) from exc
         if not 200 <= response.status < 300:

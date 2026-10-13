@@ -2,7 +2,7 @@
 
 Why this is not :mod:`aipotluck.wire`
 ------------------------------------
-``wire`` is the platform's own contract — the envelopes a consumer, a center and
+``wire`` is the platform's own contract — the envelopes a consumer, a server and
 a contribution node exchange, canonical-encoded and signed. This module is the
 contract a *tool* speaks: the JSON an OpenAI-compatible or an Anthropic-compatible
 client posts, and the JSON it expects back. The two are kept apart because they
@@ -28,7 +28,7 @@ Honesty rules the renderers enforce
   thing a renderer can say is "this answer is complete". A request that did not
   complete is an error document, never a short answer.
 * ``usage`` is rendered from what the platform actually reported — the token
-  total the center billed, and the input/output split from the contributing
+  total the server billed, and the input/output split from the contributing
   node's final measurement. When neither exists the block is *omitted*. Zeros
   would be a statement that the call was free, which is a claim about money the
   renderer cannot support.
@@ -36,7 +36,7 @@ Honesty rules the renderers enforce
 Secrecy: nothing here reads a credential, a key file, or the environment, so no
 document it renders can carry one.
 
-Convergence note: the center renders the same OpenAI shapes from its own gateway
+Convergence note: the server renders the same OpenAI shapes from its own gateway
 in ``ai-potluck-server``. Unifying the two renderers into one shared definition
 is a deliberate later step; until then a shape is written down exactly once per
 side, and a change to one is a change to review against the other.
@@ -131,12 +131,12 @@ class UnforwardableParameterError(ProtocolError):
 
     Why the platform cannot carry them. The signed consumer path submits its
     body as canonical JSON, and :func:`aipotluck.canonical.canonicalize` refuses
-    a float outright — as does the center's own
+    a float outright — as does the server's own
     :func:`aipotluck.canonical.loads_strict` when it parses that body — so
     ``temperature: 0.7`` cannot be submitted as the number it is. The encoding
     that *does* carry a fraction through canonical JSON is
     :func:`aipotluck.wire.encode_chat_parameters`' shortest round-tripping
-    decimal string, but the center re-encodes the parameters of a submitted body
+    decimal string, but the server re-encodes the parameters of a submitted body
     through that same function, and it accepts a number only: the string
     ``"0.7"`` is refused as "must be a number". A fraction therefore has no
     representation both sides of the signed path accept, and this endpoint says
@@ -152,9 +152,9 @@ class UnforwardableParameterError(ProtocolError):
         super().__init__(
             f"this endpoint cannot forward a fractional value for {listed}: the "
             "signed consumer path carries its body as canonical JSON, which refuses "
-            "floats, and the center re-reads the parameters as numbers only. Send a "
-            "whole number, omit the parameter, or point the tool at the center's own "
-            "OpenAI-compatible surface at <center-url>/openai/v1, which parses a "
+            "floats, and the server re-reads the parameters as numbers only. Send a "
+            "whole number, omit the parameter, or point the tool at the server's own "
+            "OpenAI-compatible surface at <server-url>/openai/v1, which parses a "
             "tool's body with the standard library and forwards fractions."
         )
 
@@ -553,7 +553,7 @@ def aggregate_models(nodes: Iterable[Any]) -> list[dict[str, Any]]:
     date, and a real timestamp it does have beats a zero that only looks like one.
 
     Args:
-        nodes: The entries of the center's node listing.
+        nodes: The entries of the server's node listing.
 
     Returns:
         One model document per advertised model, sorted by name.
@@ -775,9 +775,9 @@ def anthropic_sse(document: Mapping[str, Any]) -> bytes:
 
 
 def settled_tokens(status: Mapping[str, Any]) -> int | None:
-    """Return the token total the center billed for the winning attempt.
+    """Return the token total the server billed for the winning attempt.
 
-    Read off the request's status document, from the attempt the center selected
+    Read off the request's status document, from the attempt the server selected
     — the same row the receipt behind it names, so the number a caller reads is
     the number that was billed rather than a sum of reported halves.
     """

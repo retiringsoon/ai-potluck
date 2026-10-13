@@ -25,7 +25,7 @@ Three sources are read, each the way its own tool writes it:
 
 A tool names a *base* URL and this node's adapter POSTs to exactly the URL it is
 given, so completing the path is part of the import: an imported configuration
-that merely looked right would fail every attempt the center dispatched. The
+that merely looked right would fail every attempt the server dispatched. The
 provider style is a property of the source and is not offered as an override,
 because a node that posts a chat-completions body at an Anthropic upstream fails
 loudly at the upstream and silently at the pool.

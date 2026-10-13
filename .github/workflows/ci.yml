@@ -2,7 +2,7 @@
 # the two Python versions the project supports (>=3.11).
 #
 # The suite covers the protocol/domain core and the client CLIs without a
-# center; the integration tests that spin up a real center live in the
+# server; the integration tests that spin up a real server live in the
 # ai-potluck-server repository and run there.
 #
 # pytest's system temp directory is writable on a normal CI runner, so no

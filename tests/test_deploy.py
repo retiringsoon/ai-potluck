@@ -5,8 +5,8 @@ the constructed objects are asserted on concretely. The refusal tests pin the
 fail-closed behaviour the network contract promises: a node without a usable
 upstream never connects, and a fake upstream never silently swallows an
 api_key. Every failure path is also checked for secret leakage: the token
-present in the config must not appear in any raised text. The center-side
-loader (``load_center``) lives in the ``ai-potluck-server`` repository.
+present in the config must not appear in any raised text. The server-side
+loader (``load_server``) lives in the ``ai-potluck-server`` repository.
 """
 
 from __future__ import annotations
@@ -30,6 +30,11 @@ CONSUMER_TOKEN = "consumer-token-deploy-secret"
 NODE_TOKEN = "node-token-deploy-secret"
 API_KEY = "sk-upstream-key-deploy-secret"
 
+#: The URL key a pre-rename config carried. Spelled literally here rather than
+#: read from `RENAMED_CONFIG_KEYS`, so the test pins the key a real stale file
+#: holds: a guard whose mapping drifted would otherwise still pass.
+STALE_URL_KEY = "center_url"
+
 
 def _write_json(path: Path, document: dict[str, Any]) -> Path:
     """Write a strict-JSON configuration file."""
@@ -50,7 +55,7 @@ def _node_document(tmp_path: Path, **adapter: Any) -> dict[str, Any]:
     }
     http_adapter.update(adapter)
     return {
-        "center_url": "ws://127.0.0.1:9100/v1/node-link",
+        "server_url": "ws://127.0.0.1:9100/v1/node-link",
         "node_id": "node-A",
         "device_id": "device-A",
         "device_key_id": "device-key-A",
@@ -103,7 +108,7 @@ def test_load_node_builds_connector_config_and_http_adapter(tmp_path: Path) -> N
     assert config.device_id == "device-A"
     assert config.device_key_id == "device-key-A"
     assert config.provider_id == "provider-A"
-    assert config.center_url == "ws://127.0.0.1:9100/v1/node-link"
+    assert config.server_url == "ws://127.0.0.1:9100/v1/node-link"
     assert config.token == NODE_TOKEN
     assert config.adapter_name == "main"
     assert config.model == "coding-pool"
@@ -132,13 +137,46 @@ def test_load_node_builds_fake_adapter(tmp_path: Path) -> None:
 
 
 def test_load_consumer_round_trips_and_refuses_non_http(tmp_path: Path) -> None:
-    document = {"center_url": "https://center.example.com", "token": CONSUMER_TOKEN}
+    document = {"server_url": "https://server.example.com", "token": CONSUMER_TOKEN}
     path = _write_json(tmp_path / "consumer.json", document)
     assert load_consumer(path) == document
 
-    document["center_url"] = "ftp://center.example.com"
+    document["server_url"] = "ftp://server.example.com"
     path = _write_json(tmp_path / "bad-scheme.json", document)
     with pytest.raises(DeploymentError) as excinfo:
         load_consumer(path)
     assert "https://" in str(excinfo.value)
     assert CONSUMER_TOKEN not in str(excinfo.value)
+
+
+def test_a_config_still_naming_the_old_url_key_is_refused_and_points_at_the_new_one(
+    tmp_path: Path,
+) -> None:
+    """Both loaders refuse a pre-rename file and name the replacement key.
+
+    The rename is forward-only, so there is no path that reads either spelling
+    and guesses. What an operator with an older ``consumer.json`` or
+    ``node.json`` gets is the key they wrote and the key to write instead —
+    never a report that ``server_url`` is simply absent from a file that looks
+    complete to them, and never a message quoting a secret.
+    """
+    stale_consumer = _write_json(
+        tmp_path / "consumer.json",
+        {STALE_URL_KEY: "https://server.example.com", "token": CONSUMER_TOKEN},
+    )
+    with pytest.raises(DeploymentError) as excinfo:
+        load_consumer(stale_consumer)
+    message = str(excinfo.value)
+    assert STALE_URL_KEY in message
+    assert "renamed to 'server_url'" in message
+    assert CONSUMER_TOKEN not in message
+
+    stale_node = _node_document(tmp_path)
+    stale_node[STALE_URL_KEY] = stale_node.pop("server_url")
+    with pytest.raises(DeploymentError) as excinfo:
+        load_node(_write_json(tmp_path / "node.json", stale_node))
+    message = str(excinfo.value)
+    assert STALE_URL_KEY in message
+    assert "renamed to 'server_url'" in message
+    assert NODE_TOKEN not in message
+    assert API_KEY not in message

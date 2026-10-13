@@ -15,11 +15,11 @@
 - **Ask**: streaming (`--stream`) and buffered modes; model inferred from online nodes; failure
   causes and next steps surfaced; end-to-end cancel.
 - **Contribute**: setup wizard with credential-safe self-check; run/pause/resume/status; local
-  concurrency and exposure caps that the center cannot raise.
+  concurrency and exposure caps that the server cannot raise.
 - **Audit**: five-dimension offline receipt verification (`verify receipt`); bilateral
   reconciliation (`share reconcile`, `admin reconcile`); tamper-evident with named-record
   reporting; read-only and fail-closed on missing databases.
-- **Center**: single process, embedded SQLite, one port (HTTP+WS+SSE), built-in TLS or reverse
+- **Server**: single process, embedded SQLite, one port (HTTP+WS+SSE), built-in TLS or reverse
   proxy, restart recovery, deployment guide (systemd/launchd/backup/key handling).
 - **Release hygiene**: offline-install bundle with an automated build gate (clean tree + fresh
   venv + real end-to-end smoke + `RELEASE_INFO` commit stamp).
@@ -31,7 +31,7 @@
 ## 🚢 Shipped since v0.1.0
 
 - **OpenAI-compatible endpoint** (`ai-potluck-server`): `POST /openai/v1/chat/completions`
-  (buffered and streaming) and `GET /openai/v1/models`, authenticated with center-issued,
+  (buffered and streaming) and `GET /openai/v1/models`, authenticated with server-issued,
   revocable, quota-bearing API keys (`admin api-key | api-key-list | api-key-revoke`), with
   per-key concurrency and rate limits and one structured log line per request. A request's
   conversation reaches the contributor's upstream **verbatim** — the internal request model
@@ -44,7 +44,7 @@
 - **A loopback signing proxy and the config tools** (this repo): `potluck serve-openai`
   serves the tools' own shapes on 127.0.0.1 only — `POST /v1/chat/completions` (OpenAI)
   and `POST /v1/messages` (Anthropic, so Claude Code works unmodified) — signing every
-  request with this machine's identity, so no center-issued key exists to leak.
+  request with this machine's identity, so no server-issued key exists to leak.
   `potluck contribute import-config` reads an upstream endpoint/model/key from a tool the
   contributor already uses (Claude Code settings, codex config, env), and
   `potluck config emit` prints the paste-ready consumer side. Fractional chat parameters
@@ -57,7 +57,7 @@
 - **Agent session support**: a request may carry a session identifier — `x-potluck-session` on
   the OpenAI-compatible surface (an OpenAI SDK client sends it through `default_headers` and
   changes nothing else), `session_id` in the body on the signed one — and `potluck serve-openai`
-  mints one session per endpoint run and stamps every request it signs with it. The center
+  mints one session per endpoint run and stamps every request it signs with it. The server
   aggregates requests, native tokens and milli-credits per `(tenant, subject, session)`, counting
   only turns that actually settled, and `potluck-server admin session-list` / `session-show` read
   it back — the latter listing the receipts behind the totals, so a summary can be checked
@@ -68,15 +68,15 @@
 - **Long-task deadline per API key**: `admin api-key --deadline-ms` gives one key a longer
   request window than the OpenAI surface's own default, which is what an agent loop's long turn
   needs. It lengthens the *request*, not the HTTP connection — the surface's ~110s wait window
-  still answers `504` naming a request the center keeps running, and the turn is collected
+  still answers `504` naming a request the server keeps running, and the turn is collected
   afterwards through its receipt.
 - **Server-side dispatch queue**: a request no node can take right now is held rather than
   refused, offered first-come-first-served when one frees up, and bounded by `max_queue_depth`
-  (default 100) in `center.json`, with `queue_enabled: false` for an operator who would rather
+  (default 100) in `server.json`, with `queue_enabled: false` for an operator who would rather
   shed load than hold it. Both transitions ride the request's own event stream as
   `request.queued` / `request.dispatched`. Waiting changes *when* a request is answered and never
   whether it is billed honestly: a queued request keeps its own deadline, and the same sweep that
-  always ended an overdue request still ends it `EXPIRED` with the center's reason, no attempt
+  always ended an overdue request still ends it `EXPIRED` with the server's reason, no attempt
   behind it and no charge. Queue position is best-effort, not promised.
 
 ## 🔧 Next — committed
@@ -85,7 +85,7 @@
 |---|---|
 | Standalone public repo + first GitHub release | publish from a standalone repository with a clean, rebuilt history |
 | CLI output internationalization (EN) | all CLI strings are Chinese today; the docs are already bilingual |
-| Local signing proxy for the OpenAI surface | the endpoint shipped; what is still missing is a way to keep signing client-side — a small local proxy that signs each request with the consumer's own key, symmetric with the contributor connector, for callers who do not want to extend the center bounded spending authority |
+| Local signing proxy for the OpenAI surface | the endpoint shipped; what is still missing is a way to keep signing client-side — a small local proxy that signs each request with the consumer's own key, symmetric with the contributor connector, for callers who do not want to extend the server bounded spending authority |
 | Tool calling over the OpenAI surface | `tools`/`tool_choice` are ignored today and one text choice comes back; forwarding them means rendering `tool_calls` deltas and a `finish_reason` of `tool_calls`, which is what agent frameworks need |
 | Config import and emitters | contributors: parse an existing Claude Code settings.json / codex config.toml / env vars for upstream endpoint+model+key; consumers: emit a ready-to-paste Claude Code env block or a plain base_url + api_key |
 | Multiple models per node | one node currently shares exactly one upstream model |
@@ -103,7 +103,7 @@
 | Platform-observed metering (`platform_observed` evidence) | would you accept a traffic-visible proxy for stronger guarantees? |
 | Attested metering (`attested_meter`, TEE) | worth it only with compatible hardware supply — tell us if you have it |
 | x402-style per-call payments | machine-payable usage without accounts |
-| Docker image for the center | must-have or nice-to-have? |
+| Docker image for the server | must-have or nice-to-have? |
 | Web chat UI | a small hosted page that talks to the OpenAI-compatible endpoint — the friendly answer for non-CLI members; CLI `ask` stays as the plumbing/test path |
 | Credit-bid-weighted dispatch ordering | the shipped queue is first-come-first-served and its position is explicitly not promised; would a bidder who pays more jump it, and what would that do to a pool of friends? |
 | Performance batch (deferred) | delta batching + WAL `synchronous=NORMAL` (write-path headroom for 100+-user scale) and a 500-stream load-test harness — explicitly deferred until the community tier shows real usage |
@@ -116,4 +116,4 @@
 - A public strangers' marketplace with open enrollment
 - Custody of real money or withdrawal promises
 - Anonymous supply or features whose purpose is bypassing upstream terms of service
-- Federated/P2P trust (the center is deliberately simple and accountable)
+- Federated/P2P trust (the server is deliberately simple and accountable)

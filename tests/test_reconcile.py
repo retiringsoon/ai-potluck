@@ -4,9 +4,9 @@ The node-side difference kinds are covered in isolation here, so a check that
 stops firing is caught by name instead of only by an end-to-end test going
 quietly green; the ``share reconcile`` refusal of a missing ``node.db`` is
 covered through ``aipotluck.cli.main`` the way the installed console script
-drives it, and needs no running center. The end-to-end reconciliations against
-a real center (operator and consumer views included) live in the
-``ai-potluck-server`` repository's suite, beside the center they drive against.
+drives it, and needs no running server. The end-to-end reconciliations against
+a real server (operator and consumer views included) live in the
+``ai-potluck-server`` repository's suite, beside the server they drive against.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def _write_node_config_without_a_database(path: Path, database: Path) -> None:
     placeholder that is never sent anywhere: the refusal happens before any dial.
     """
     document = {
-        "center_url": "ws://127.0.0.1:1/v1/node-link",
+        "server_url": "ws://127.0.0.1:1/v1/node-link",
         "node_id": "node-without-a-database",
         "device_id": "node-without-a-database",
         "device_key_id": "device-key-1",
@@ -73,11 +73,11 @@ def test_share_reconcile_refuses_a_node_database_that_does_not_exist(
 ) -> None:
     """A contributor's missing ``node.db`` is reported, not silently replaced.
 
-    Creating it would do two harms at once: every attempt the center lists would
-    be reported as ``missing_locally``, which reads as "the center claims work I
+    Creating it would do two harms at once: every attempt the server lists would
+    be reported as ``missing_locally``, which reads as "the server claims work I
     never did" rather than "I am looking at the wrong file", and the empty
     database would still be there for the next `share run` to continue from, as
-    if this node had never executed anything. The refusal comes before the center
+    if this node had never executed anything. The refusal comes before the server
     is dialed, so this needs no running platform.
     """
     database = tmp_path / "never-started" / "node.db"
@@ -129,7 +129,7 @@ def _claim(
     settlement_status: str = "SETTLED",
     receipt_id: str | None = "R-1",
 ) -> NodeAttemptView:
-    """Build the center's claim about one attempt."""
+    """Build the server's claim about one attempt."""
     return NodeAttemptView(
         attempt_id=attempt_id,
         request_id=request_id,
@@ -166,10 +166,10 @@ def test_matching_records_produce_no_difference() -> None:
     assert _diff(executions=[_execution()], remote=[_claim()]) == []
 
 
-def test_an_attempt_the_center_never_heard_of_is_named() -> None:
-    """Work this node ran and the center does not list is the contributor's loss."""
+def test_an_attempt_the_server_never_heard_of_is_named() -> None:
+    """Work this node ran and the server does not list is the contributor's loss."""
     differences = _diff(executions=[_execution("att-9")])
-    assert _kinds(differences) == ["missing_at_center"]
+    assert _kinds(differences) == ["missing_at_server"]
     assert _subjects(differences) == ["attempt att-9"]
 
 
@@ -195,8 +195,8 @@ def test_a_request_disagreement_is_named() -> None:
     assert "request_mismatch" in _kinds(differences)
 
 
-def test_a_submitted_attempt_the_center_never_settled_is_named() -> None:
-    """The node reported final usage and the center billed nothing."""
+def test_a_submitted_attempt_the_server_never_settled_is_named() -> None:
+    """The node reported final usage and the server billed nothing."""
     differences = _diff(
         executions=[_execution()],
         remote=[_claim(status="FAILED", usage_tokens=None, settlement_status="PENDING",
@@ -206,16 +206,16 @@ def test_a_submitted_attempt_the_center_never_settled_is_named() -> None:
 
 
 def test_a_settled_attempt_with_no_receipt_is_named() -> None:
-    """The center says it billed but names no receipt: there is nothing to verify."""
+    """The server says it billed but names no receipt: there is nothing to verify."""
     differences = _diff(executions=[_execution()], remote=[_claim(receipt_id=None)])
     assert "settled_without_receipt" in _kinds(differences)
 
 
 def test_an_unresolved_unknown_outcome_is_named() -> None:
-    """A node that cannot say, and a center that has not decided, is an open loss.
+    """A node that cannot say, and a server that has not decided, is an open loss.
 
     ``UNKNOWN`` means the process died around the upstream call, so tokens may
-    have been consumed. If the center reached a terminal state the outcome is
+    have been consumed. If the server reached a terminal state the outcome is
     settled one way or the other and there is nothing to report; if it has not,
     the contributor is carrying an unbounded exposure.
     """
@@ -231,7 +231,7 @@ def test_an_unresolved_unknown_outcome_is_named() -> None:
 
 
 def test_an_execution_that_never_finished_is_named() -> None:
-    """A row left in ``SUBMITTING`` under a terminal center attempt never closed out."""
+    """A row left in ``SUBMITTING`` under a terminal server attempt never closed out."""
     differences = _diff(
         executions=[_execution(state="SUBMITTING")],
         remote=[_claim(status="FAILED", usage_tokens=None, settlement_status="PENDING",
@@ -252,7 +252,7 @@ def _spooled_final(attempt_id: str = "att-1", seq: int = 3) -> SpoolRecord:
     )
 
 
-def test_a_signed_report_the_center_never_acknowledged_is_named() -> None:
+def test_a_signed_report_the_server_never_acknowledged_is_named() -> None:
     """A ``usage.final`` still in the spool is a report this node signed and lost.
 
     This is the most consequential thing a contributor can hold locally: the

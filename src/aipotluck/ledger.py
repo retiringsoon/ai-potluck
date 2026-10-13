@@ -1,7 +1,7 @@
 """Integer credit ledger: reservations, paired journals, and settlement.
 
 Why this lives in the client package: replaying a receipt's journal is part of
-trustless verification, so the ledger rules are a protocol primitive. Center
+trustless verification, so the ledger rules are a protocol primitive. Server
 bookkeeping and the gateway live in ``ai-potluck-server``, which imports these
 primitives to keep its own books.
 

@@ -1,7 +1,7 @@
 """Client TLS defaults, honoring a privately deployed CA.
 
 Deployment modes that terminate TLS at a reverse proxy typically present a
-certificate from a private CA (self-signed for an IP-hosted center, or an
+certificate from a private CA (self-signed for an IP-hosted server, or an
 internal CA). The system trust store knows nothing about that CA, so a client
 on a machine that did not install it globally fails verification with
 ``unable to get local issuer certificate``.

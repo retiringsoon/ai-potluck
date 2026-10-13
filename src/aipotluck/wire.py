@@ -1,4 +1,4 @@
-"""Wire protocol for the center <-> connector and consumer <-> center links.
+"""Wire protocol for the server <-> connector and consumer <-> server links.
 
 Every message is a strictly parsed JSON envelope. Parsing goes through
 `canonical.loads_strict`, so the network boundary inherits the same refusals as
@@ -32,7 +32,7 @@ SCHEMA_ENVELOPE = "aipotluck.envelope.v1"
 #: protocol violation: the sender must split it, not push it.
 MAX_MESSAGE_BYTES = 256 * 1024
 
-#: Longest output delta the center accepts in one event, in characters.
+#: Longest output delta the server accepts in one event, in characters.
 MAX_DELTA_CHARS = 64 * 1024
 
 EventType = Literal["output.delta", "usage.final", "attempt.failed", "attempt.completed"]
@@ -53,26 +53,26 @@ MAX_CHAT_MESSAGES = 512
 
 #: Longest accepted session identifier. A bound rather than a policy, for the
 #: same reason `MAX_CHAT_MESSAGES` is one: the identifier is stored on the
-#: request row, keyed into the center's session aggregate, and printed by an
+#: request row, keyed into the server's session aggregate, and printed by an
 #: operator command, so it has to stay a single readable token rather than an
 #: unbounded blob a caller can use to make a listing unreadable.
 MAX_SESSION_ID_CHARS = 128
 
 #: The header an OpenAI-compatible surface reads a session identifier from.
-#: Named once here, in the package both sides already share, so a center and a
+#: Named once here, in the package both sides already share, so a server and a
 #: client cannot drift apart about the spelling of one header. An agent
 #: framework that drives a conversation through the OpenAI SDK sets it with
 #: ``default_headers`` and needs no other change: the surface is otherwise
 #: exactly OpenAI's.
 SESSION_HEADER = "x-potluck-session"
 
-#: The request parameters a center forwards to the upstream, named exactly as
+#: The request parameters a server forwards to the upstream, named exactly as
 #: OpenAI's Chat Completions API names them. Anything else in a request body is
 #: ignored rather than forwarded: the set is what the platform has decided it
 #: will honour, so an upstream-specific field cannot become an undocumented way
 #: to change what a node asks a provider for. ``model``, ``messages``,
 #: ``stream`` and ``stream_options`` are deliberately absent — the first two are
-#: the request itself and the last two are the delivery mode the center chose.
+#: the request itself and the last two are the delivery mode the server chose.
 CHAT_PARAMETER_KEYS = frozenset(
     {
         "temperature",
@@ -128,7 +128,7 @@ def new_session_id() -> str:
     A session is one run of a caller's own agent loop; the context stays
     client-side and every turn is still one separately authorized request, so
     this identifies a *series* of requests rather than granting anything. It is
-    unguessable anyway: a center aggregates by it, and a predictable identifier
+    unguessable anyway: a server aggregates by it, and a predictable identifier
     would let one process on a shared machine attribute its own turns to
     somebody else's run.
     """
@@ -143,7 +143,7 @@ def check_session_id(value: str) -> str:
     a line break would inject a field, and it is printed by an operator command,
     where whitespace or a control character would render as a listing nobody can
     read. Refusing is the honest answer — trimming or dropping it would leave a
-    caller believing its run was aggregated under a name the center never saw.
+    caller believing its run was aggregated under a name the server never saw.
 
     Args:
         value: The identifier a caller named.
@@ -375,7 +375,7 @@ class NodeHello:
     """Opening message from a connector.
 
     `device_key_id` names the key that will sign this node's usage reports. The
-    center resolves it through its own registry rather than trusting the
+    server resolves it through its own registry rather than trusting the
     connection, so a node cannot claim a device identity it does not hold.
     """
 
@@ -387,7 +387,7 @@ class NodeHello:
     model: str
     policy: NodePolicy
     #: Attempts the node believes it still owns, from its local execution table.
-    #: Sent so the center can reconcile an uncertain execution instead of
+    #: Sent so the server can reconcile an uncertain execution instead of
     #: assuming it never started.
     open_attempts: tuple[str, ...] = ()
 
@@ -435,7 +435,7 @@ class NodeHello:
 
 @dataclass(frozen=True)
 class ResumeDirective:
-    """What the center wants the node to do with an unfinished attempt.
+    """What the server wants the node to do with an unfinished attempt.
 
     The node must not re-execute an attempt named here unless the directive says
     so; that is how a reconnect stops short of a second upstream call.
@@ -475,7 +475,7 @@ class ResumeDirective:
 
 @dataclass(frozen=True)
 class HelloAck:
-    """Center's reply to `node.hello`."""
+    """Server's reply to `node.hello`."""
 
     node_id: str
     server_time: dt.datetime
@@ -518,7 +518,7 @@ class ChatMessage:
     ``content`` stays whatever the requester sent: a string, the list of typed
     content parts OpenAI defines for a multimodal message, or `None` for a
     message that carries tool calls instead of text. Nothing in this layer
-    interprets or reshapes it, and that is the point — a center that flattened a
+    interprets or reshapes it, and that is the point — a server that flattened a
     conversation into one prompt string would destroy exactly the multi-turn
     context the upstream is being asked about, and the requester could not tell
     from the answer that it had been rewritten.
@@ -657,7 +657,7 @@ def _encode_parameter(key: str, value: Any) -> Any:
         if isinstance(value, str):
             # The string form is this function's own output: a fraction that
             # crossed canonical JSON travels as its decimal string, and both
-            # the center's re-encode and a replay must land on the same bytes.
+            # the server's re-encode and a replay must land on the same bytes.
             try:
                 number = float(value)
             except ValueError:
@@ -671,7 +671,7 @@ def _encode_parameter(key: str, value: Any) -> Any:
         # One canonical spelling per value: integral values encode as JSON
         # integers, everything else as the shortest decimal string that reads
         # back as the same double (`repr`). Encoding is idempotent, so a
-        # consumer, the center's re-encode, and a string that crossed
+        # consumer, the server's re-encode, and a string that crossed
         # canonical JSON all sign the same digest.
         if number.is_integer():
             return int(number)
@@ -772,11 +772,11 @@ def compute_request_digest(
 
 @dataclass(frozen=True)
 class AttemptOffer:
-    """Center's proposal of one attempt to one node.
+    """Server's proposal of one attempt to one node.
 
     `permit_hash` binds the offer's economic terms into a single digest. The node
     echoes it inside its signed usage report, so a report cannot be replayed onto
-    a different attempt or a different budget: the center recomputes the digest
+    a different attempt or a different budget: the server recomputes the digest
     from what it actually offered and refuses a mismatch.
 
     `messages` and `parameters` are the work itself, forwarded to the upstream
@@ -868,7 +868,7 @@ def compute_permit_hash(
         epoch: Dispatch epoch.
         model: Model the node is asked to run.
         request_digest: Digest of the immutable request payload.
-        max_milli_credits: Ceiling the center is willing to pay.
+        max_milli_credits: Ceiling the server is willing to pay.
         authorization_hash: Digest of the signed consumer authorization.
 
     Returns:
@@ -964,7 +964,7 @@ class AttemptDecision:
 
     An acceptance carries the node's own digest of what it agreed to. That digest
     travels back inside the signed usage report, so the device ends up signing
-    over the exact offer it accepted rather than over whatever the center claims
+    over the exact offer it accepted rather than over whatever the server claims
     it offered.
     """
 
@@ -1059,7 +1059,7 @@ class AttemptEvent:
     A delta event carries its text; a usage event carries both the numbers and
     the device's **signed** usage report; a terminal event carries the outcome.
     The numbers travel twice on purpose: the report is what settlement actually
-    verifies, and carrying the plain numbers alongside lets the center refuse a
+    verifies, and carrying the plain numbers alongside lets the server refuse a
     node that signs one total and announces another.
 
     Sequence numbers are per attempt and must be strictly increasing from 1, so a
@@ -1174,7 +1174,7 @@ class AttemptEvent:
 
 @dataclass(frozen=True)
 class EventAck:
-    """Center's acknowledgement of a contiguous prefix of an attempt's events."""
+    """Server's acknowledgement of a contiguous prefix of an attempt's events."""
 
     attempt_id: str
     acked_seq: int

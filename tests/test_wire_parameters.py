@@ -3,7 +3,7 @@
 A fraction cannot cross canonical JSON as a number: `canonicalize` refuses
 floats, so the wire carries `DECIMAL_CHAT_PARAMETERS` values as decimal
 strings. That only works if `encode_chat_parameters` accepts its own output —
-a consumer signing `0.7`, the string `"0.7"` it becomes, and the center's
+a consumer signing `0.7`, the string `"0.7"` it becomes, and the server's
 re-encode must all produce the same bytes, or the request digest falls apart
 somewhere along the signed path.
 """

@@ -10,16 +10,16 @@ record, and a person decides what to do.
 
 Two views live here, one per client party:
 
-`verify_receipt_from_center`
+`verify_receipt_from_server`
     One receipt through `verify.verify_offline`'s five dimensions, read from the
     three documents a consumer can fetch over HTTP.
 
 `reconcile_node`
     The contributor's view: local ``executions`` and ``spool`` rows against the
-    attempts the center says it dispatched to this node.
+    attempts the server says it dispatched to this node.
 
-The operator's views — `verify_receipt_at_center` over the center's own store
-and `reconcile_center` across its tables — live in ``ai-potluck-server``, which
+The operator's views — `verify_receipt_at_server` over the server's own store
+and `reconcile_server` across its tables — live in ``ai-potluck-server``, which
 imports the shared verdict shapes (`Difference`, `ReceiptVerification`) and the
 claimed-leaf derivation from here.
 
@@ -31,9 +31,9 @@ report no differences.
 What the consumer's view cannot prove
 ------------------------------------
 A consumer fetching over HTTP learns the platform's settlement public key from
-the same center that serves the receipt, so `ledger_included` authenticates the
-checkpoint against a key the center supplied. That detects a lost, reordered or
-short log and a proof that does not fold; it does not detect a center that
+the same server that serves the receipt, so `ledger_included` authenticates the
+checkpoint against a key the server supplied. That detects a lost, reordered or
+short log and a proof that does not fold; it does not detect a server that
 rewrote history and re-signed the result. Pinning ``public_key_b64`` out of
 band and comparing checkpoints across runs is what closes that gap.
 `metering_provenance` stays ``unknown`` on this path because the consumer holds
@@ -61,7 +61,7 @@ from .verify import VerificationInput, VerificationReport, verify_offline
 #: Where a verified receipt's facts came from: the operator's own store, or the
 #: documents a consumer fetched over HTTP. The distinction is part of the
 #: verdict, because the two paths do not hold the same evidence.
-Source = Literal["center-store", "center-http"]
+Source = Literal["server-store", "server-http"]
 
 #: The five dimensions, in the order `VerificationReport.render` shows them.
 DIMENSIONS: tuple[str, ...] = (
@@ -72,7 +72,7 @@ DIMENSIONS: tuple[str, ...] = (
     "account_history_complete",
 )
 
-#: The attempt states that mean the center will never do more work on an attempt.
+#: The attempt states that mean the server will never do more work on an attempt.
 _TERMINAL_ATTEMPT_STATUSES = frozenset(
     {"COMPLETED", "FAILED", "CANCELLED", "OUTCOME_UNKNOWN", "REVOKED_BEFORE_SUBMIT"}
 )
@@ -109,7 +109,7 @@ class ReceiptVerification:
     """One receipt's five-dimension verdict, plus where the facts came from.
 
     `findings` carries what a `VerificationReport` cannot express: a receipt the
-    center no longer holds, or a document that could not be read as a record.
+    server no longer holds, or a document that could not be read as a record.
     Those are differences too, and a command that stayed silent about them would
     report a clean verdict for a record that is simply gone.
     """
@@ -202,7 +202,7 @@ def claimed_leaf_bytes(
 # --------------------------------------------------------------------------
 
 
-def verify_receipt_from_center(
+def verify_receipt_from_server(
     *,
     receipt_document: Mapping[str, Any],
     checkpoint_document: Mapping[str, Any],
@@ -251,7 +251,7 @@ def verify_receipt_from_center(
     served_hash = _require_str(receipt_document, "receipt_hash", "the receipt response")
     if record.hash != served_hash:
         findings.append(
-            f"the center served receipt {receipt_id} under hash {served_hash} but its own "
+            f"the server served receipt {receipt_id} under hash {served_hash} but its own "
             f"payload hashes to {record.hash}; the body and its index disagree"
         )
 
@@ -280,7 +280,7 @@ def verify_receipt_from_center(
         digest = canonical_digest(contract.digest_payload())
         if digest != contract_hash:
             findings.append(
-                f"the center served allocation contract {contract.contract_id} "
+                f"the server served allocation contract {contract.contract_id} "
                 f"v{contract.version} hashing to {digest}, but receipt {receipt_id} is "
                 f"bound to {contract_hash or '<none>'}; the served split is not the "
                 "promised one"
@@ -293,7 +293,7 @@ def verify_receipt_from_center(
         findings.append(
             f"receipt {receipt_id} does not appear in account "
             f"{history_document.get('account_id', '<unknown>')!s}'s history, so the "
-            "center's own books do not list the charge it served a receipt for"
+            "server's own books do not list the charge it served a receipt for"
         )
 
     report = verify_offline(
@@ -314,7 +314,7 @@ def verify_receipt_from_center(
         )
     )
     return ReceiptVerification(
-        receipt_id=receipt_id, source="center-http", report=report, findings=tuple(findings)
+        receipt_id=receipt_id, source="server-http", report=report, findings=tuple(findings)
     )
 
 
@@ -323,10 +323,10 @@ def _registry_from_checkpoint(
 ) -> IdentityRegistry:
     """Build a registry holding the settlement key a checkpoint publishes.
 
-    The key arrives from the same center that serves the receipt, so this
+    The key arrives from the same server that serves the receipt, so this
     authenticates the receipt against the platform's *claimed* key. That is the
     honest limit of the HTTP path and the reason a consumer who wants a root the
-    center cannot rewrite pins ``public_key_b64`` out of band.
+    server cannot rewrite pins ``public_key_b64`` out of band.
 
     Args:
         checkpoint_document: The checkpoint response.
@@ -348,7 +348,7 @@ def _registry_from_checkpoint(
     ):
         findings.append(
             "the checkpoint published no usable settlement public key, so the receipt's "
-            "signature cannot be checked; upgrade the center or pin the key out of band"
+            "signature cannot be checked; upgrade the server or pin the key out of band"
         )
         return registry
     try:
@@ -376,7 +376,7 @@ def _checkpoint_from(
     Returns:
         ``(checkpoint, public_key)``, either of which may be `None`. `verify`
         degrades `ledger_included` to ``unknown`` without both, which is the
-        correct answer: an unanchored root proves only that the center agrees
+        correct answer: an unanchored root proves only that the server agrees
         with itself.
     """
     try:
@@ -435,7 +435,7 @@ def _inclusion_proof(body: Mapping[str, Any]) -> InclusionProof | None:
 
 
 def _contract_from(body: Any) -> AllocationContract | None:
-    """Rebuild an allocation contract from the digest payload a center serves.
+    """Rebuild an allocation contract from the digest payload a server serves.
 
     Returns:
         The contract, or `None` when the response carried none or a malformed
@@ -461,7 +461,7 @@ def _contract_from(body: Any) -> AllocationContract | None:
 
 
 def _promised_receipt_ids(history_document: Mapping[str, Any]) -> frozenset[str]:
-    """Return the receipt ids a center says touched this account."""
+    """Return the receipt ids a server says touched this account."""
     listed = history_document.get("receipt_ids")
     if not isinstance(listed, Sequence) or isinstance(listed, (str, bytes)):
         return frozenset()
@@ -469,7 +469,7 @@ def _promised_receipt_ids(history_document: Mapping[str, Any]) -> frozenset[str]
 
 
 def _expected_sequence(history_document: Mapping[str, Any]) -> tuple[int, ...]:
-    """Return the contiguous history positions a center promises.
+    """Return the contiguous history positions a server promises.
 
     Derived from ``entry_count``, which the endpoint reports separately from the
     entry list, so a history that arrived truncated or with a position missing is
@@ -536,13 +536,13 @@ def _require_mapping(body: Mapping[str, Any], key: str, context: str) -> dict[st
 
 
 # --------------------------------------------------------------------------
-# Node-side reconciliation: what this node recorded vs what the center claims
+# Node-side reconciliation: what this node recorded vs what the server claims
 # --------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class NodeAttemptView:
-    """The center's claim about one attempt, as its node endpoint returns it.
+    """The server's claim about one attempt, as its node endpoint returns it.
 
     Parsed once here so `reconcile_node` works from typed fields and a test can
     build a view directly instead of staging an HTTP response.
@@ -598,16 +598,16 @@ class NodeAttemptView:
 
     @property
     def settled(self) -> bool:
-        """Whether the center says this attempt was billed."""
+        """Whether the server says this attempt was billed."""
         return self.settlement_status == "SETTLED"
 
     @property
     def terminal(self) -> bool:
-        """Whether the center will do no more work on this attempt."""
+        """Whether the server will do no more work on this attempt."""
         return self.status in _TERMINAL_ATTEMPT_STATUSES
 
     def describe(self) -> str:
-        """Render the center's claim, restricted to the fields compared here."""
+        """Render the server's claim, restricted to the fields compared here."""
         receipt = self.receipt_id or "<none>"
         tokens = "unknown" if self.usage_tokens is None else str(self.usage_tokens)
         return (
@@ -629,21 +629,21 @@ def reconcile_node(
     spool: Sequence[SpoolRecord],
     remote_attempts: Sequence[NodeAttemptView],
 ) -> list[Difference]:
-    """Diff this node's own durable record against the center's claim.
+    """Diff this node's own durable record against the server's claim.
 
-    Both directions are checked. A local execution the center never heard of is
+    Both directions are checked. A local execution the server never heard of is
     work the contributor may have paid an upstream for and never been billed for;
-    a center attempt with no local execution is a dispatch this node has no
-    record of running, which is either a lost database or a center inventing
+    a server attempt with no local execution is a dispatch this node has no
+    record of running, which is either a lost database or a server inventing
     work. Field-level disagreements — epoch, request, terminal state, upstream
     call count — are reported separately, because each points at a different
     side.
 
     The local record is what the connector wrote: ``executions`` for what this
-    node started and how it ended, ``ack_cursors`` for how far the center
+    node started and how it ended, ``ack_cursors`` for how far the server
     acknowledged, and ``spool`` for signed events still undelivered. A
     ``usage.final`` left in the spool is a report this node signed with its
-    device key, so it is compared against the center's settlement state rather
+    device key, so it is compared against the server's settlement state rather
     than merely counted.
 
     Args:
@@ -651,7 +651,7 @@ def reconcile_node(
         executions: Every local execution row.
         ack_cursors: Acknowledged sequence per attempt.
         spool: Every still-unacknowledged spooled event.
-        remote_attempts: The center's view of this node's attempts.
+        remote_attempts: The server's view of this node's attempts.
 
     Returns:
         The differences, ordered by attempt so the same input renders the same
@@ -681,9 +681,9 @@ def reconcile_node(
             differences.append(
                 Difference(
                     subject=f"attempt {attempt_id}",
-                    kind="missing_at_center",
+                    kind="missing_at_server",
                     local=_describe_execution(execution, ack_cursors),
-                    remote="<the center lists no such attempt for this node>",
+                    remote="<the server lists no such attempt for this node>",
                 )
             )
             continue
@@ -704,7 +704,7 @@ def _describe_execution(execution: ExecutionRecord, ack_cursors: Mapping[str, in
 def _spooled_final_reports(spool: Sequence[SpoolRecord]) -> dict[str, list[SpoolRecord]]:
     """Group the still-unacknowledged ``usage.final`` events by attempt.
 
-    A spool row of this type is a usage report this node signed and the center
+    A spool row of this type is a usage report this node signed and the server
     has not acknowledged, which is the single most consequential thing a
     contributor can hold locally: it is the difference between being paid and
     not being paid for work already done.
@@ -719,7 +719,7 @@ def _spooled_final_reports(spool: Sequence[SpoolRecord]) -> dict[str, list[Spool
 def _compare_attempt(
     execution: ExecutionRecord, claim: NodeAttemptView, ack_cursors: Mapping[str, int]
 ) -> list[Difference]:
-    """Compare one local execution with the center's claim about the same attempt."""
+    """Compare one local execution with the server's claim about the same attempt."""
     differences: list[Difference] = []
     subject = f"attempt {execution.attempt_id}"
     local = _describe_execution(execution, ack_cursors)
@@ -749,7 +749,7 @@ def _compare_attempt(
         add("execution_never_finished")
     if execution.state == "UNKNOWN" and not claim.terminal:
         # The node cannot say whether the upstream consumed tokens, and neither
-        # can the center: the attempt is open on both sides with no outcome. A
+        # can the server: the attempt is open on both sides with no outcome. A
         # settled claim resolves it, so only an unresolved one is reported.
         add("outcome_unresolved")
     if claim.settled and claim.receipt_id is None:
@@ -763,7 +763,7 @@ def _compare_spool(
     claim: NodeAttemptView,
     spooled_finals: Mapping[str, Sequence[SpoolRecord]],
 ) -> list[Difference]:
-    """Compare this node's undelivered signed reports with the center's state."""
+    """Compare this node's undelivered signed reports with the server's state."""
     pending = spooled_finals.get(attempt_id)
     if not pending:
         return []

@@ -13,10 +13,10 @@ integer credit ledger, and an append-only transparency log that anyone can
 re-verify offline.
 
 **Companion repo:** [ai-potluck-server](https://github.com/retiringsoon/ai-potluck-server)
-is the center (gateway + settlement books + operator CLI). Dependency
+is the server (gateway + settlement books + operator CLI). Dependency
 direction is one-way: **verification primitives live here in the client; the
 server depends on this package and imports them to keep its own books**, so a
-client can verify a receipt without trusting the center. Never make the
+client can verify a receipt without trusting the server. Never make the
 client import from the server.
 
 ## Layout map (`src/aipotluck/`)
@@ -51,7 +51,7 @@ client import from the server.
 
 Also: `tests/` (behavior-level suite), `scripts/` (`acceptance_kit.sh`,
 `dev_fake_upstream.py`, `support_matrix.py`), `docs/` (proposal, roadmap,
-network contract, center deployment), `install.sh` (user installer).
+network contract, server deployment), `install.sh` (user installer).
 
 ## Build / test / verify
 

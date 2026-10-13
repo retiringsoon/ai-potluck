@@ -20,7 +20,7 @@ ai-potluck turns that handshake into infrastructure:
 - **Every charge is provable.** Each answer produces a signed receipt and a
   transparency-log entry anyone can verify offline (`potluck verify receipt`) —
   and interrupted work is reconciled, not guessed.
-- **The center keeps the books, not the power.** It routes, meters, and
+- **The server keeps the books, not the power.** It routes, meters, and
   settles; it never sees an upstream credential, and clients can check its
   arithmetic against the public ledger.
 
@@ -31,7 +31,7 @@ Supply is invite-only and consent-based — see
 This repository is the client side: the `potluck` command, the connector, and
 the protocol and verification core. Module layout follows one rule — the
 protocol and verification primitives live here in `ai-potluck`, so a client can
-verify a receipt without trusting the center; the center's bookkeeping and
+verify a receipt without trusting the server; the server's bookkeeping and
 gateway live in the companion repository
 [`ai-potluck-server`](../ai-potluck-server) (`potluck-server`), which depends on
 this package and imports these verification primitives to keep its own books.
@@ -115,12 +115,12 @@ receipt`) instead of trusting anyone's spreadsheet.
 Ask the operator for an invite code, then:
 
 ```bash
-potluck join --center http://host:port --invite CODE
+potluck join --server http://host:port --invite CODE
 potluck ask "your question" --stream
 ```
 
 `join` generates an Ed25519 key on this machine (mode 0600), redeems the code at
-the center, and saves the identity to `~/.aipotluck` — later commands need no
+the server, and saves the identity to `~/.aipotluck` — later commands need no
 further setup. Your invite carries a small milli-credit quota; `ask --stream`
 prints each increment as it arrives. Real output looks like this (answer text
 and numbers are illustrative):
@@ -142,7 +142,7 @@ document.
 
 Two ways in, and they differ in what proves the spend was authorized.
 
-**The center's OpenAI endpoint** — the drop-in path. The center serves
+**The server's OpenAI endpoint** — the drop-in path. The server serves
 `POST /openai/v1/chat/completions` and `GET /openai/v1/models`, authenticated
 with an API key the operator mints for your consumer identity:
 
@@ -150,11 +150,11 @@ with an API key the operator mints for your consumer identity:
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://<center>/openai/v1",   # the center, not a provider
+    base_url="https://<server>/openai/v1",   # the server, not a provider
     api_key="ak-…",                          # potluck-server admin api-key
 ```
 
-The center signs the terms it admits with its own settlement key
+The server signs the terms it admits with its own settlement key
 (`gateway_authenticated`), so a receipt from this path verifies honestly while
 naming a weaker authorization than your own signature — the distinction the
 docs keep rather than blur.
@@ -165,7 +165,7 @@ runs a loopback endpoint (127.0.0.1 only) that speaks **both** shapes:
 - `POST /v1/chat/completions` and `GET /v1/models` (OpenAI wire)
 - `POST /v1/messages` (Anthropic wire — Claude Code works unmodified)
 
-Every request is signed with this machine's `~/.aipotluck` identity; no center-
+Every request is signed with this machine's `~/.aipotluck` identity; no server-
 issued key exists to leak, and spending authority never leaves your hands —
 symmetric with how a contributor's connector holds its own credentials.
 
@@ -184,9 +184,9 @@ else already configured.
 ### Good to know
 
 - **Pay per use, never per month**: the invite quota is the whole budget; the
-  center declines work that would exceed it.
+  server declines work that would exceed it.
 - **Interrupted answers are not silent charges**: if a node disappears
-  mid-answer the attempt is marked *usage to be confirmed* and the center
+  mid-answer the attempt is marked *usage to be confirmed* and the server
   reconciles it — you are never billed for a number nobody can produce.
 - **Your prompt travels**: the contributing node sees your prompt (it runs the
   model). Details in [Trust model](#trust-model) and
@@ -199,7 +199,7 @@ You supply capacity you are allowed to resell — see
 then:
 
 ```bash
-potluck join --node --center http://host:port --invite CODE \
+potluck join --node --server http://host:port --invite CODE \
   --upstream-endpoint https://api.example/v1/chat/completions \
   --upstream-model MODEL \
   --upstream-key-file ./key
@@ -219,30 +219,30 @@ What happens on your machine:
 
 - The upstream key is stored only in this machine's `node.json` (mode 0600). It
   is never uploaded and never printed.
-- The setup self-check probes the upstream and the center over TCP only — it
+- The setup self-check probes the upstream and the server over TCP only — it
   does not send your credential. `--probe-upstream-live` opts into one real,
   billable upstream request instead.
 - Secrets are read from a file or an environment variable
   (`AIPOTLUCK_UPSTREAM_KEY`), never from a command-line argument, which every
   process on the host can read.
 
-## Run your own center
+## Run your own server
 
-A center is a single process over an embedded SQLite database — nothing else to
+A server is a single process over an embedded SQLite database — nothing else to
 install. It ships in the companion repository `ai-potluck-server`, which depends
 on this one. Deployment (TLS, service supervision, tunnels) is covered in
-[docs/center-deployment.md](docs/center-deployment.md).
+[docs/server-deployment.md](docs/server-deployment.md).
 
 ```bash
 uv pip install ai-potluck-server   # or: -e <ai-potluck-server checkout>
-potluck-server serve --config center.json
+potluck-server serve --config server.json
 ```
 
-Mint invite codes on the center machine, where the store file lives:
+Mint invite codes on the server machine, where the store file lives:
 
 ```bash
-potluck-server admin invite --config center.json --role consumer --tenant main
-potluck-server admin invite --config center.json --role node --tenant main
+potluck-server admin invite --config server.json --role consumer --tenant main
+potluck-server admin invite --config server.json --role node --tenant main
 ```
 
 A code is printed once; only its digest is stored.
@@ -275,18 +275,18 @@ differences" over a store that is simply gone.
 potluck verify receipt --receipt-id R-1
 potluck verify receipt --receipt-id R-1 --json
 
-# Operator — the same check against the center's own database, which also holds
+# Operator — the same check against the server's own database, which also holds
 # the signed usage report, so all five dimensions are assessable.
-potluck-server verify receipt --config center.json --receipt-id R-1
+potluck-server verify receipt --config server.json --receipt-id R-1
 
-# Contributor — diff node.db against the attempts the center dispatched here
+# Contributor — diff node.db against the attempts the server dispatched here
 # (the node config defaults to ~/.aipotluck/node.json).
 potluck share reconcile
 
 # Operator — cross-check attempts, settlements, receipts, transparency-log
 # leaves and the ledger replay log against each other, in both directions.
-# --config is required: this command reads a center's own database.
-potluck-server admin reconcile --config center.json
+# --config is required: this command reads a server's own database.
+potluck-server admin reconcile --config server.json
 ```
 
 `verify receipt` reports five dimensions separately — `signature_valid`,
@@ -300,13 +300,13 @@ fail the command: from the consumer side `metering_provenance` is always
 commands exit 0 when the records agree and 1 when any difference stands.
 
 A consumer reading over HTTP learns the platform's settlement public key from the
-same center that serves the receipt, which detects a lost or reordered log but
-not a center that rewrote history and re-signed it. Pin `public_key_b64` from
+same server that serves the receipt, which detects a lost or reordered log but
+not a server that rewrote history and re-signed it. Pin `public_key_b64` from
 `GET /v1/checkpoint` out of band to close that gap.
 
 ## Behind a proxy
 
-Outbound dials (ask/request to the center, the node-link WebSocket, and the
+Outbound dials (ask/request to the server, the node-link WebSocket, and the
 node's upstream call) honor the standard proxy variables:
 
 ```bash
@@ -333,7 +333,7 @@ you use it.
 - Invite-only onboarding.
 - No top-up and no withdrawal: credits are minted by the operator and cannot be
   cashed out.
-- One center, one instance — no federation or high availability.
+- One server, one instance — no federation or high availability.
 - Only the environments in [Supported environments](#supported-environments);
   Windows is not supported natively, so use WSL2.
 
@@ -350,7 +350,7 @@ uv pip install -e ".[dev]"
 ```
 
 The end-to-end release gate — a real install plus the default join/ask path
-against a real center — lives in the `ai-potluck-server` repository
+against a real server — lives in the `ai-potluck-server` repository
 (`scripts/release_gate.sh`), because it drives both packages.
 
 `--basetemp` is only needed in sandboxes that block pytest from creating its
@@ -363,4 +363,4 @@ at zero warnings.
 - [Proposal & early-user asks (RFC)](docs/PROPOSAL.md) ([中文](docs/PROPOSAL.zh-CN.md))
 - [Roadmap](docs/ROADMAP.md)
 - [Network contract v0.1](docs/network-contract-v0.1.md)
-- [Center deployment](docs/center-deployment.md)
+- [Server deployment](docs/server-deployment.md)

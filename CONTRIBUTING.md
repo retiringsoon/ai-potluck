@@ -2,7 +2,7 @@
 
 Thanks for helping make shared AI access provable. This repo is the client
 side: the `potluck` CLI, the connector, and the protocol/verification core.
-The center (gateway + books) lives in
+The server (gateway + books) lives in
 [ai-potluck-server](https://github.com/retiringsoon/ai-potluck-server).
 
 ## Branching and dev workflow
@@ -53,7 +53,7 @@ suite are all green — see [AGENTS.md](AGENTS.md) for the evidence rule.
 
 The full install-and-run gate (`scripts/release_gate.sh`) lives in the
 [ai-potluck-server](https://github.com/retiringsoon/ai-potluck-server) repo,
-because it exercises both packages through a real center. Run it before
+because it exercises both packages through a real server. Run it before
 calling a cross-cutting change releasable.
 
 ## Commit discipline
@@ -85,6 +85,6 @@ calling a cross-cutting change releasable.
   config, forward-only) that every change must respect.
 - [SECURITY.md](SECURITY.md) — how to report a vulnerability privately.
 - [docs/network-contract-v0.1.md](docs/network-contract-v0.1.md) — the wire
-  contract between clients and a center.
+  contract between clients and a server.
 - Questions or ideas before opening an issue:
   [Discussions](https://github.com/retiringsoon/ai-potluck/discussions).
