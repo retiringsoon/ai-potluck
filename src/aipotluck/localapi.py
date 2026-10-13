@@ -27,6 +27,17 @@ property that matters: the endpoint is not reachable from another machine, so th
 set of processes that can spend it is the set that already could. No credential
 this endpoint reads is ever written into a response, a header, or a log line.
 
+The loopback argument does *not* hold for a web page the user happens to
+visit: a browser cannot open a port or read the key file, but it can fire a
+CORS simple request at ``127.0.0.1:8787`` without the visitor's knowledge.
+Two guards close that gap. A request carrying a non-loopback ``Origin`` is
+refused with ``403`` before any routing or spend — a local tool or ``curl``
+sends no ``Origin`` and is unaffected. And the body must arrive as
+``Content-Type: application/json``: a content type outside the browser's
+simple-request safelist forces a preflight ``OPTIONS`` this endpoint answers
+with ``405``, so the browser blocks the actual request. Together they mean a
+visited page cannot reach the signing path.
+
 Billing honesty
 ---------------
 An answer is rendered as a completion only for a request that reached
@@ -822,6 +833,8 @@ def _handler_class(
 
         def do_GET(self) -> None:
             """Serve ``GET /v1/models``."""
+            if not self._refuse_cross_origin():
+                return
             route = _route_of(self.path)
             try:
                 if route == "/v1/models":
@@ -845,6 +858,8 @@ def _handler_class(
             for: routed by prefix it would parse as a completion request and
             spend credit to answer a question about counting.
             """
+            if not self._refuse_cross_origin():
+                return
             route = _route_of(self.path)
             try:
                 if route == "/v1/chat/completions":
@@ -860,6 +875,42 @@ def _handler_class(
                     )
             finally:
                 self._log_line(f"POST {route}")
+
+        def do_OPTIONS(self) -> None:
+            """Refuse preflight: the endpoint serves no cross-origin surface.
+
+            A browser sends ``OPTIONS`` before a cross-origin request whose
+            ``Content-Type`` is not in its simple-request safelist. Answering it
+            would let such a request through, so it is refused rather than
+            answered — which is what keeps the content-type guard meaningful.
+            """
+            self._refuse(
+                405,
+                "method_not_allowed",
+                "OPTIONS is not served; this endpoint answers only the tools' "
+                "own request shapes",
+            )
+
+        def _refuse_cross_origin(self) -> bool:
+            """Return ``True`` if the request may proceed, refusing it otherwise.
+
+            A request carrying a non-loopback ``Origin`` is a cross-origin
+            browser caller: it can reach this loopback endpoint through a CORS
+            simple request and spend this machine's identity credit without the
+            visitor's knowledge. Such a request is refused before any routing or
+            spend. Local tools and ``curl`` send no ``Origin`` and are unaffected.
+            """
+            origin = self.headers.get("Origin")
+            if origin and not _is_loopback_origin(origin):
+                self._refuse(
+                    403,
+                    "forbidden_origin",
+                    "this endpoint serves only same-machine callers; a "
+                    "cross-origin request is refused so a visited page cannot "
+                    "spend this identity's credit",
+                )
+                return False
+            return True
 
         # -- the routes -----------------------------------------------------
 
@@ -1284,6 +1335,16 @@ def _handler_class(
                     anthropic=anthropic,
                 )
                 return None
+            if not _is_json_content_type(self.headers.get("Content-Type", "")):
+                self._refuse(
+                    415,
+                    "invalid_request",
+                    "this endpoint requires Content-Type: application/json; a "
+                    "browser simple request would not send it, so this refusal "
+                    "also blocks cross-origin spend",
+                    anthropic=anthropic,
+                )
+                return None
             try:
                 length = int(raw_length)
             except ValueError:
@@ -1359,6 +1420,30 @@ def _is_anthropic_route(route: str) -> bool:
     something this endpoint does not serve reads the error shape it parses.
     """
     return route.startswith("/v1/messages")
+
+
+def _is_loopback_origin(origin: str) -> bool:
+    """Return whether an ``Origin`` header names a loopback caller.
+
+    A local tool talking to its own ``base_url`` sends no ``Origin`` at all; a
+    page served from a loopback address sends one whose host is loopback. Any
+    other origin is a cross-origin browser caller this endpoint refuses, because
+    it would otherwise spend this machine's identity credit on a visit.
+    """
+    host = origin.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def _is_json_content_type(value: str) -> bool:
+    """Return whether a ``Content-Type`` header asks for JSON.
+
+    Only ``application/json`` (an optional ``; charset=`` is stripped) is
+    accepted. Requiring it forces a cross-origin browser request through a
+    preflight the endpoint does not answer, which is the second half of keeping
+    a visited page from reaching the signing path.
+    """
+    media = value.split(";", 1)[0].strip().lower()
+    return media == "application/json"
 
 
 def _not_supported_message(route: str) -> str:

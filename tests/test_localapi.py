@@ -1644,3 +1644,132 @@ def test_the_emitted_configuration_is_a_configuration_that_works(
     assert status == 200
     assert [model["id"] for model in document["data"]] == [MODEL]
     assert len(server.admitted) == 2, "one request per completion route, none for the list"
+
+
+# --------------------------------------------------------------------------- #
+# P0-2: a visited web page must not reach the signing path
+# --------------------------------------------------------------------------- #
+
+
+def test_a_cross_origin_post_is_refused_before_any_spend(
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
+) -> None:
+    """A browser visiting an evil page fires a CORS simple request here.
+
+    The endpoint signs as this machine's identity and spends its credit, so a
+    cross-origin ``Origin`` is refused with ``403`` before any routing or spend:
+    the server never admitted the request.
+    """
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
+    try:
+        response = _send(
+            connection,
+            "POST",
+            "/v1/chat/completions",
+            _chat(),
+            headers={"Origin": "https://evil.example"},
+        )
+        document = json.loads(response.read())
+        status = response.status
+    finally:
+        connection.close()
+
+    assert status == 403
+    assert document["error"]["code"] == "forbidden_origin"
+    assert server.admitted == [], "the visited page spent nothing"
+
+
+def test_a_cross_origin_get_is_refused_too(
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
+) -> None:
+    """The model list is the same loopback surface and gets the same guard."""
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
+    try:
+        response = _send(
+            connection, "GET", "/v1/models", headers={"Origin": "https://evil.example"}
+        )
+        document = json.loads(response.read())
+        status = response.status
+    finally:
+        connection.close()
+
+    assert status == 403
+    assert document["error"]["code"] == "forbidden_origin"
+    assert server.admitted == []
+
+
+def test_a_text_plain_body_is_refused_not_forwarded(
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
+) -> None:
+    """A browser simple request arrives as ``text/plain`` with no preflight.
+
+    Requiring ``application/json`` forces that request through a preflight the
+    endpoint answers with ``405``, so the browser blocks it. The body is refused
+    with ``415`` here, before anything is signed or submitted.
+    """
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
+    try:
+        response = _send(
+            connection,
+            "POST",
+            "/v1/chat/completions",
+            _chat(),
+            headers={"content-type": "text/plain"},
+        )
+        document = json.loads(response.read())
+        status = response.status
+    finally:
+        connection.close()
+
+    assert status == 415
+    assert document["error"]["code"] == "invalid_request"
+    assert server.admitted == [], "an unsigned, un-forwarded body costs nothing"
+
+
+def test_a_preflight_options_is_refused(
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
+) -> None:
+    """Answering an ``OPTIONS`` preflight would let a cross-origin request through.
+
+    The endpoint serves no cross-origin surface, so the preflight is refused with
+    ``405`` and the browser blocks the actual request.
+    """
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
+    try:
+        connection.request(
+            "OPTIONS",
+            "/v1/chat/completions",
+            headers={"content-type": "application/json"},
+        )
+        response = connection.getresponse()
+        status = response.status
+        response.read()
+    finally:
+        connection.close()
+
+    assert status == 405
+
+
+def test_a_same_machine_request_without_origin_is_unaffected(
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
+) -> None:
+    """The guard is an allowlist: a local tool sends no ``Origin`` and is served.
+
+    Pinned explicitly so a future change cannot turn the guard into a blanket
+    refusal of the only callers the endpoint exists for.
+    """
+    server.answer_with(deltas=DELTAS)
+    endpoint_server = endpoint()
+
+    status, _headers, document, _raw = _call(
+        endpoint_server, "POST", "/v1/chat/completions", _chat()
+    )
+
+    assert status == 200
+    assert document["choices"][0]["message"]["content"] == ANSWER
+    assert len(server.admitted) == 1
+
