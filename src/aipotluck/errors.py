@@ -118,9 +118,9 @@ class ProtocolError(PotluckError):
 
 
 class GatewayError(PotluckError):
-    """Raised for a center-gateway condition no narrower exception describes.
+    """Raised for a server-gateway condition no narrower exception describes.
 
     Examples are an unknown receipt and a dispatch input that went missing,
-    which are operational failures of the center rather than protocol
+    which are operational failures of the server rather than protocol
     violations by a peer.
     """

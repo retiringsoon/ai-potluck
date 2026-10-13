@@ -2,7 +2,7 @@
 """A minimal OpenAI-compatible upstream for local smoke tests.
 
 Why this exists: the release gate (``scripts/release_gate.sh``) must exercise the
-contributor → center → consumer path with a *real* HTTP upstream, in a real
+contributor → server → consumer path with a *real* HTTP upstream, in a real
 process, without a provider account. This is that upstream: one endpoint,
 ``POST /v1/chat/completions``, the two wire modes the node adapter speaks
 (``stream: true`` as Server-Sent Events, ``stream: false`` as one JSON body), and
@@ -62,7 +62,7 @@ def usage_document(prompt: str, reply: str) -> dict[str, int]:
     """Return an OpenAI-shaped usage block with non-zero token totals.
 
     The counts are character counts, not real tokens. They only have to be
-    positive and small: the center settles 1 milli-credit per billed token, so
+    positive and small: the server settles 1 milli-credit per billed token, so
     a smoke request must stay under the node's local exposure ceiling.
     """
     prompt_tokens = max(1, len(prompt))

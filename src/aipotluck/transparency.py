@@ -1,8 +1,8 @@
 """Append-only Merkle transparency log with signed checkpoints.
 
 Why this lives in the client package: verifying inclusion and checkpoint
-signatures is something a client does without trusting the center, so the log
-primitives are part of the protocol layer. Center bookkeeping and the gateway
+signatures is something a client does without trusting the server, so the log
+primitives are part of the protocol layer. Server bookkeeping and the gateway
 live in ``ai-potluck-server``, which imports these primitives to keep its own
 books.
 

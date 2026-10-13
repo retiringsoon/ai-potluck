@@ -2,9 +2,9 @@
 
 The node keeps a durable record of what it already executed, so a reconnect can
 never issue a second upstream call, and of what it already produced, so nothing
-is lost when the link drops before the center acknowledges it.
+is lost when the link drops before the server acknowledges it.
 
-The center's own store (``CenterStore``, its schema and its event plumbing)
+The server's own store (``ServerStore``, its schema and its event plumbing)
 lives in the ``ai-potluck-server`` package; this module holds the shared
 ``_Store`` plumbing carved down to the node's four tables, the ``NodeStore``
 built on it, and the record shapes both sides speak (``ExecutionRecord``,
@@ -101,7 +101,7 @@ def _load_payload(text: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 # Record shapes. `ReceiptRecord` is defined here, on the verification side of
 # the split, because the consumer's receipt verification rebuilds one from the
-# documents HTTP can supply; the center store in `ai-potluck-server` imports it
+# documents HTTP can supply; the server store in `ai-potluck-server` imports it
 # rather than growing a second spelling of the same row.
 # --------------------------------------------------------------------------
 
@@ -208,7 +208,7 @@ class _Store:
     def open(cls, path: str | Path) -> Self:
         """Open (or create) the store at `path` and ensure the schema exists.
 
-        Creating is what the process that *owns* a database needs — a center
+        Creating is what the process that *owns* a database needs — a server
         started by ``potluck-server serve``, a node started by ``potluck share run``.
         A command that only opens somebody else's database calls
         `open_existing` instead, so a path that names nothing reports that fact
@@ -224,7 +224,7 @@ class _Store:
         which is fatal for a command that reads one. A lost or mistyped
         ``database_path`` would come back as a freshly created empty database,
         and an empty database reports no differences: ``admin reconcile`` over a
-        center whose database is entirely gone would print that both sides agree
+        server whose database is entirely gone would print that both sides agree
         and exit 0, which is the one answer an audit must never give. The same
         applies to a node database rebuilt from nothing, which a later
         ``share run`` would then continue with as if the node had never worked.
@@ -245,7 +245,7 @@ class _Store:
             raise PotluckError(
                 f"database {candidate} does not exist: this command opens a "
                 "database, it does not create one — start the process that owns "
-                "it (`potluck-server serve` for a center, `potluck share run` for a "
+                "it (`potluck-server serve` for a server, `potluck share run` for a "
                 f"node), or correct the database_path that names {candidate}"
             )
         if candidate.stat().st_size == 0:
@@ -253,7 +253,7 @@ class _Store:
                 f"database {candidate} is empty (0 bytes): no schema was ever "
                 "written to it, so it holds no records to open — restore it from "
                 "a backup, or delete it and let the process that owns it "
-                "(`potluck-server serve` for a center, `potluck share run` for a node) "
+                "(`potluck-server serve` for a server, `potluck share run` for a node) "
                 "create a fresh one"
             )
         return cls(path)
@@ -324,7 +324,7 @@ class NodeStore(_Store):
 
     It records what the node already started so a reconnect cannot issue a
     second upstream call, and what it already produced so nothing is lost when
-    the link drops before the center acknowledges it.
+    the link drops before the server acknowledges it.
     """
 
     def begin_execution(
@@ -416,7 +416,7 @@ class NodeStore(_Store):
         """Return every execution this node started, ordered by attempt ID.
 
         Read-only whole-table view for reconciliation: unlike `open_executions`
-        it includes finished rows, because a finished local execution the center
+        it includes finished rows, because a finished local execution the server
         knows nothing about is the difference a contributor needs to see.
         """
         conn = self._connection()
@@ -491,7 +491,7 @@ class NodeStore(_Store):
         """Return every still-unacknowledged spooled event, ordered by attempt then seq.
 
         `unacked_spool` answers for one attempt; reconciliation needs the whole
-        queue at once, because an event this node signed and the center never
+        queue at once, because an event this node signed and the server never
         acknowledged is a difference even when its attempt has long finished.
         """
         conn = self._connection()

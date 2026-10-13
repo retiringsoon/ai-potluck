@@ -85,7 +85,7 @@ UNCERTAIN_USAGE_COST_TEXT: Final[str] = (
     "check it against the receipt later)"
 )
 
-#: The bounded-wait message shown when the center has no node for the model.
+#: The bounded-wait message shown when the server has no node for the model.
 NO_NODES_PHRASE: Final[str] = "no available nodes"
 NO_NODES_NEXT_STEP: Final[str] = (
     "no available nodes: retry later or contact the operator; "
@@ -143,7 +143,7 @@ def uncertain_usage_cost_text(*, receipt_id: str | None = None) -> str:
 
     Args:
         receipt_id: The receipt the amount will eventually appear under, when
-            the center issued one. Naming it turns "we do not know" into
+            the server issued one. Naming it turns "we do not know" into
             "here is where to check", which is the difference between a
             confusing silence and an actionable one.
     """
@@ -161,7 +161,7 @@ class FailureKind(StrEnum):
     CREDENTIALS = "credentials"
     QUOTA = "insufficient_funds"
     UPSTREAM_UNREACHABLE = "upstream_unreachable"
-    CENTER_UNREACHABLE = "center_unreachable"
+    SERVER_UNREACHABLE = "server_unreachable"
     NO_NODES = "no_nodes"
     TIMEOUT = "timeout"
     CONFLICT = "conflict"
@@ -185,7 +185,7 @@ CREDENTIALS_GUIDANCE = FailureGuidance(
     phrase="credential no longer valid",
     next_step=(
         "credential no longer valid: re-run "
-        "`potluck join --center <center url> --invite <new code>` for a fresh "
+        "`potluck join --server <server url> --invite <new code>` for a fresh "
         "identity, or contact the operator to re-issue or unblock your key"
     ),
 )
@@ -196,7 +196,7 @@ QUOTA_GUIDANCE = FailureGuidance(
         "insufficient credit: contact the operator to add credit to your account "
         "(an operator grants it to a new member with "
         "`potluck-server admin invite --quota <milli-credits>`, or tops up an existing "
-        "account on the center directly), then retry"
+        "account on the server directly), then retry"
     ),
 )
 UPSTREAM_UNREACHABLE_GUIDANCE = FailureGuidance(
@@ -209,12 +209,12 @@ UPSTREAM_UNREACHABLE_GUIDANCE = FailureGuidance(
         "`potluck share status`, and re-runs `potluck share setup` if needed)"
     ),
 )
-CENTER_UNREACHABLE_GUIDANCE = FailureGuidance(
-    kind=FailureKind.CENTER_UNREACHABLE,
-    phrase="center unreachable",
+SERVER_UNREACHABLE_GUIDANCE = FailureGuidance(
+    kind=FailureKind.SERVER_UNREACHABLE,
+    phrase="server unreachable",
     next_step=(
-        "center unreachable: check the center address, this machine's network, "
-        "and whether the center process is running"
+        "server unreachable: check the server address, this machine's network, "
+        "and whether the server process is running"
     ),
 )
 NO_NODES_GUIDANCE = FailureGuidance(
@@ -258,7 +258,7 @@ _GUIDANCE_BY_CODE: Final[dict[str, FailureGuidance]] = {
     "invalid_token": CREDENTIALS_GUIDANCE,
     "insufficient_funds": QUOTA_GUIDANCE,
     "upstream_unreachable": UPSTREAM_UNREACHABLE_GUIDANCE,
-    "center_unreachable": CENTER_UNREACHABLE_GUIDANCE,
+    "server_unreachable": SERVER_UNREACHABLE_GUIDANCE,
     "no_nodes": NO_NODES_GUIDANCE,
     "timeout": TIMEOUT_GUIDANCE,
     "conflict": CONFLICT_GUIDANCE,
@@ -283,7 +283,7 @@ def guidance_for(kind: FailureKind) -> FailureGuidance:
         CREDENTIALS_GUIDANCE,
         QUOTA_GUIDANCE,
         UPSTREAM_UNREACHABLE_GUIDANCE,
-        CENTER_UNREACHABLE_GUIDANCE,
+        SERVER_UNREACHABLE_GUIDANCE,
         NO_NODES_GUIDANCE,
         TIMEOUT_GUIDANCE,
         CONFLICT_GUIDANCE,
@@ -325,8 +325,8 @@ def classify_failure(
         if guidance is not None:
             return guidance
     lowered = message.lower()
-    if "could not reach the center" in lowered:
-        return CENTER_UNREACHABLE_GUIDANCE
+    if "could not reach the server" in lowered:
+        return SERVER_UNREACHABLE_GUIDANCE
     if "did not reach a terminal state within" in lowered:
         return TIMEOUT_GUIDANCE
     if "unreachable" in lowered:

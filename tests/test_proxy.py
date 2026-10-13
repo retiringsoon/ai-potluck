@@ -1,7 +1,7 @@
 """Proxy support: URL parsing, environment resolution, and live relay round-trips.
 
 The relay tests use fake in-process proxies that forward to real loopback
-servers under a fake hostname (``center.example``), which also proves the
+servers under a fake hostname (``server.example``), which also proves the
 remote-resolution semantics: the client never resolves the destination, the
 proxy does.
 """
@@ -25,7 +25,7 @@ from aipotluck.proxy import (
     resolve_proxy,
 )
 
-FAKE_HOST = "center.example"
+FAKE_HOST = "server.example"
 
 
 # --------------------------------------------------------------------------- #
@@ -64,8 +64,8 @@ def test_resolve_proxy_selects_by_destination_scheme(monkeypatch: pytest.MonkeyP
 
 def test_resolve_proxy_honors_no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     env = {"HTTPS_PROXY": "http://10.0.0.2:8443", "NO_PROXY": "other.example, .internal"}
-    assert resolve_proxy("https", "center.example", env) is not None
-    assert resolve_proxy("https", "center.INTERNAL", env) is None
+    assert resolve_proxy("https", "server.example", env) is not None
+    assert resolve_proxy("https", "server.INTERNAL", env) is None
     assert resolve_proxy("https", "x.internal", env) is None
     assert resolve_proxy("https", "internal.example", env) is not None
     env["NO_PROXY"] = "*"
@@ -77,7 +77,7 @@ def test_loopback_is_always_direct(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resolve_proxy("https", "127.0.0.1", {}) is None
     assert resolve_proxy("https", "localhost", {}) is None
     assert is_loopback_host("127.5.0.1")
-    assert not is_loopback_host("center.example")
+    assert not is_loopback_host("server.example")
 
 
 # --------------------------------------------------------------------------- #

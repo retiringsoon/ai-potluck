@@ -303,7 +303,7 @@ def test_every_turn_reaches_the_upstream_verbatim(
 
     The node is a proxy for one provider call, so the multi-turn context the
     requester paid for has to be the context the model answers from. A
-    center-or-adapter that flattened the conversation into one prompt string
+    server-or-adapter that flattened the conversation into one prompt string
     would still return an answer, which is exactly why the assertion is on the
     body the upstream received rather than on the reply.
     """

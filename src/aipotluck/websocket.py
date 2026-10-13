@@ -1,6 +1,6 @@
-"""Minimal RFC 6455 WebSocket transport for the center's shared HTTPS/WSS port.
+"""Minimal RFC 6455 WebSocket transport for the server's shared HTTPS/WSS port.
 
-The center terminates HTTPS for consumers and WSS for contribution nodes on one
+The server terminates HTTPS for consumers and WSS for contribution nodes on one
 listening socket. Nodes dial out, so this module only needs a server-side upgrade
 from inside an already-accepted `http.server.BaseHTTPRequestHandler` socket and a
 client-side dial to an ``wss://`` URL. It implements exactly the framing the
@@ -564,7 +564,7 @@ class _Connection:
 
 @dataclass
 class ServerConnection(_Connection):
-    """A WebSocket connection the center accepted from a contribution node.
+    """A WebSocket connection the server accepted from a contribution node.
 
     Built by `handshake_server` on a socket that has already completed the
     upgrade, so the handshake itself never appears here. Frames this side sends
@@ -579,7 +579,7 @@ class ServerConnection(_Connection):
 
 @dataclass
 class ClientConnection(_Connection):
-    """A WebSocket connection dialled out to a center over ``ws://`` or ``wss://``.
+    """A WebSocket connection dialled out to a server over ``ws://`` or ``wss://``.
 
     Frames this side sends are masked with a fresh random key per frame, and
     frames it accepts must be unmasked. The same limitations as

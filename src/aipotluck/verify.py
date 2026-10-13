@@ -218,7 +218,7 @@ def verify_offline(data: VerificationInput) -> VerificationReport:
 #: the authentication method the record itself declares. ``consumer_signed`` is
 #: the consumer's own Ed25519 key: the party being charged signed the exact work
 #: and ceiling. ``gateway_authenticated`` is the platform's settlement key, for a
-#: request the center admitted on a credential it holds — an operator-issued API
+#: request the server admitted on a credential it holds — an operator-issued API
 #: key — instead of a signature the consumer produced; the authorization is then
 #: the platform's own record of the terms it admitted, which is real evidence of
 #: a different strength, and the receipt keeps the label rather than presenting

@@ -12,7 +12,7 @@ assignees: ""
 
 **Desired outcome** *(what would "done" look like for you)*
 
-**Your role in the group** *(consumer / contributor / center operator / not using yet)*
+**Your role in the group** *(consumer / contributor / server operator / not using yet)*
 
 **Environment** *(OS, Python version — `potluck doctor` covers this, redacted)*
 

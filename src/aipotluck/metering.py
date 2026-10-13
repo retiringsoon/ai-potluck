@@ -2,7 +2,7 @@
 
 Why this lives in the client package: normalization and evidence levels are
 protocol and verification primitives — a consumer must be able to check what a
-receipt claims without trusting the center. Center bookkeeping and the gateway
+receipt claims without trusting the server. Server bookkeeping and the gateway
 live in ``ai-potluck-server``, which imports these primitives to keep its own
 books.
 

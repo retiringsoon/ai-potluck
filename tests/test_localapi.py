@@ -1,20 +1,20 @@
-"""The loopback endpoint, driven over a real socket against a scripted center.
+"""The loopback endpoint, driven over a real socket against a scripted server.
 
 Nothing here stubs the transport. The endpoint is the real
 `aipotluck.localapi.LocalEndpointServer` on a loopback port, the tool side is a
 plain `http.client` request of the kind an OpenAI or Anthropic client makes, and
-the center side is a real `http.server.ThreadingHTTPServer` speaking the
+the server side is a real `http.server.ThreadingHTTPServer` speaking the
 platform's own consumer surface: canonical-JSON bodies, an SSE event stream, a
 status document. The socket layer is exercised rather than mocked because the
 socket layer *is* what is under test — which status a refusal carries, whether a
 stream opens before an answer exists, whether an interrupted endpoint cancels the
 work it had in flight, and whether a credential ever reaches a response.
 
-The center is scripted, not simulated: it stores the events a test tells it to
+The server is scripted, not simulated: it stores the events a test tells it to
 and answers the reads a consumer makes. It does not verify the authorization
-signature — the registry that could verify it lives in the center, and the server
-repository's suite does that beside it — but it records every body it admitted,
-so a test can assert what this machine actually signed and submitted.
+signature — the registry that could verify it lives server-side, and the
+`ai-potluck-server` suite does that beside it — but it records every body it
+admitted, so a test can assert what this machine actually signed and submitted.
 """
 
 from __future__ import annotations
@@ -57,13 +57,13 @@ ANSWER = "The receipt settles it."
 
 
 # --------------------------------------------------------------------------- #
-# The center side
+# The server side
 # --------------------------------------------------------------------------- #
 
 
 @dataclass
 class Script:
-    """How the scripted center answers the next request it admits.
+    """How the scripted server answers the next request it admits.
 
     Attributes:
         deltas: The increments the request produces, in order.
@@ -71,7 +71,7 @@ class Script:
         billed: The token total the winning attempt's row reports.
         split: The node's own input/output measurement, as a ``usage.final`` event.
         receipt_id: The receipt the settlement was written under, when there is one.
-        billing_note: The center's own reason for a request that did not succeed.
+        billing_note: The server's own reason for a request that did not succeed.
         hold: Keep the request unfinished until the test says otherwise, which is
             how a stream is made to deliver increments before the answer exists
             and how a wait window is made to close on unfinished work.
@@ -88,7 +88,7 @@ class Script:
 
 @dataclass
 class FakeRequest:
-    """One request the center admitted, with the events it has stored."""
+    """One request the server admitted, with the events it has stored."""
 
     request_id: str
     body: dict[str, Any]
@@ -118,11 +118,11 @@ class FakeRequest:
 def _answer_json(
     handler: http.server.BaseHTTPRequestHandler, status: int, document: Mapping[str, Any]
 ) -> None:
-    """Answer one center request with a canonical JSON document.
+    """Answer one server request with a canonical JSON document.
 
     Canonical rather than `json.dumps`: the consumer reads these bodies with
     `canonical.loads_strict`, so a float or a repeated key here would be a bug in
-    the fixture that the client would report as a broken center.
+    the fixture that the client would report as a broken server.
     """
     body = canonicalize(dict(document))
     handler.send_response(status)
@@ -132,8 +132,8 @@ def _answer_json(
     handler.wfile.write(body)
 
 
-class FakeCenter:
-    """A loopback center speaking the platform's own consumer HTTP surface."""
+class FakeServer:
+    """A loopback server speaking the platform's own consumer HTTP surface."""
 
     def __init__(self, *, models: Sequence[str] = ()) -> None:
         """Bind the listener and record nothing yet.
@@ -160,7 +160,7 @@ class FakeCenter:
 
     @property
     def url(self) -> str:
-        """Return the ``http://`` base URL of this center."""
+        """Return the ``http://`` base URL of this server."""
         return f"http://127.0.0.1:{int(self._httpd.server_address[1])}"
 
     def start(self) -> None:
@@ -173,14 +173,14 @@ class FakeCenter:
         self._httpd.server_close()
         self._thread.join(timeout=5.0)
         if self.errors:
-            raise AssertionError(f"the scripted center hit {self.errors[0]!r}")
+            raise AssertionError(f"the scripted server hit {self.errors[0]!r}")
 
     def answer_with(self, **script: Any) -> None:
         """Set how the next admitted request behaves."""
         self.script = Script(**script)
 
     def refuse_with(self, status: int, code: str, detail: str) -> None:
-        """Make admission fail the way a center refuses a request."""
+        """Make admission fail the way a server refuses a request."""
         self.refusal = (status, code, detail)
 
     @property
@@ -223,11 +223,11 @@ class FakeCenter:
     # -- the routes ----------------------------------------------------------
 
     def _handler_class(self) -> type[http.server.BaseHTTPRequestHandler]:
-        """Return the handler bound to this center."""
-        center = self
+        """Return the handler bound to this server."""
+        server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
-            """One center route per method, recording what it was sent."""
+            """One server route per method, recording what it was sent."""
 
             protocol_version = "HTTP/1.1"
 
@@ -241,13 +241,13 @@ class FakeCenter:
                     raw = self._body()
                     parts = _route_parts(self.path)
                     if parts == ["v1", "requests"]:
-                        center._admit(raw, self)
+                        server._admit(raw, self)
                     elif _is_request_action(parts, "cancel"):
-                        center._cancel(parts[2], self)
+                        server._cancel(parts[2], self)
                     else:
                         _answer_json(self, 404, {"error": "not_found", "detail": self.path})
                 except BaseException as exc:  # a fixture bug must not hang a test
-                    center.errors.append(exc)
+                    server.errors.append(exc)
                     self.close_connection = True
 
             def do_GET(self) -> None:
@@ -255,15 +255,15 @@ class FakeCenter:
                 try:
                     parts = _route_parts(self.path)
                     if parts == ["v1", "nodes"]:
-                        center._nodes(self)
+                        server._nodes(self)
                     elif len(parts) == 3 and parts[:2] == ["v1", "requests"]:
-                        center._status(parts[2], self)
+                        server._status(parts[2], self)
                     elif _is_request_action(parts, "events"):
-                        center._events(parts[2], self)
+                        server._events(parts[2], self)
                     else:
                         _answer_json(self, 404, {"error": "not_found", "detail": self.path})
                 except BaseException as exc:
-                    center.errors.append(exc)
+                    server.errors.append(exc)
                     self.close_connection = True
 
             def _body(self) -> bytes:
@@ -354,7 +354,7 @@ class FakeCenter:
 
         A request that is still unfinished gets what exists and then a closed
         stream, which is what makes the consumer reconnect from its cursor: the
-        same behaviour the real center has for a live request, and the reason a
+        same behaviour the real server has for a live request, and the reason a
         reconnect duplicates neither text nor charge.
         """
         cursor = _cursor_of(handler.path)
@@ -427,11 +427,11 @@ class Identity:
         return str(self.key_document["private_key_b64"])
 
 
-def _write_identity(directory: Path, center_url: str) -> Identity:
+def _write_identity(directory: Path, server_url: str) -> Identity:
     """Write the two files a ``join`` leaves behind and return them."""
     public_key_b64, private_key_b64 = generate_key_pair()
     config_document: dict[str, Any] = {
-        "center_url": center_url,
+        "server_url": server_url,
         "key_id": "consumer-key-1",
         "subject_id": SUBJECT,
         "tenant_id": "tenant-1",
@@ -452,9 +452,9 @@ def _write_identity(directory: Path, center_url: str) -> Identity:
 
 
 @pytest.fixture
-def center() -> Iterator[FakeCenter]:
-    """Return a running scripted center that advertises one model."""
-    instance = FakeCenter(models=(MODEL,))
+def server() -> Iterator[FakeServer]:
+    """Return a running scripted server that advertises one model."""
+    instance = FakeServer(models=(MODEL,))
     instance.start()
     try:
         yield instance
@@ -463,9 +463,9 @@ def center() -> Iterator[FakeCenter]:
 
 
 @pytest.fixture
-def identity(center: FakeCenter, tmp_path: Path) -> Identity:
-    """Return a joined identity whose center is the scripted one."""
-    return _write_identity(tmp_path / "aipotluck", center.url)
+def identity(server: FakeServer, tmp_path: Path) -> Identity:
+    """Return a joined identity whose server is the scripted one."""
+    return _write_identity(tmp_path / "aipotluck", server.url)
 
 
 @pytest.fixture
@@ -474,22 +474,22 @@ def endpoint(identity: Identity) -> Iterator[Callable[..., LocalEndpointServer]]
     servers: list[LocalEndpointServer] = []
 
     def start(**settings: Any) -> LocalEndpointServer:
-        server = LocalEndpointServer(
+        endpoint_server = LocalEndpointServer(
             identity=LocalIdentity.load(identity.directory),
             settings=EndpointSettings(port=0, **settings),
         )
-        server.start()
-        servers.append(server)
-        return server
+        endpoint_server.start()
+        servers.append(endpoint_server)
+        return endpoint_server
 
     yield start
-    for server in servers:
-        server.stop(grace_s=1.0)
+    for endpoint_server in servers:
+        endpoint_server.stop(grace_s=1.0)
 
 
-def _connect(server: LocalEndpointServer) -> http.client.HTTPConnection:
+def _connect(endpoint_server: LocalEndpointServer) -> http.client.HTTPConnection:
     """Open one connection to the endpoint."""
-    return http.client.HTTPConnection("127.0.0.1", server.port, timeout=30.0)
+    return http.client.HTTPConnection("127.0.0.1", endpoint_server.port, timeout=30.0)
 
 
 def _send(
@@ -515,7 +515,7 @@ def _send(
 
 
 def _call(
-    server: LocalEndpointServer,
+    endpoint_server: LocalEndpointServer,
     method: str,
     path: str,
     document: Any = None,
@@ -523,7 +523,7 @@ def _call(
     raw_body: bytes | None = None,
 ) -> tuple[int, http.client.HTTPMessage, Any, bytes]:
     """Make one buffered tool request, returning status, headers, body and bytes."""
-    connection = _connect(server)
+    connection = _connect(endpoint_server)
     try:
         response = _send(connection, method, path, document, raw_body=raw_body)
         raw = response.read()
@@ -663,7 +663,7 @@ def test_a_directory_with_no_identity_in_it_refuses_to_serve(
 
 
 def test_a_buffered_completion_is_the_pools_answer_with_the_counts_it_reported(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """One ``chat.completion``, and the platform's own handles in the headers.
 
@@ -671,11 +671,11 @@ def test_a_buffered_completion_is_the_pools_answer_with_the_counts_it_reported(
     they were just served and verify the charge behind it, so they travel in the
     body's reach even though a tool ignores headers it does not know.
     """
-    center.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134), receipt_id=RECEIPT)
-    server = endpoint()
+    server.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134), receipt_id=RECEIPT)
+    endpoint_server = endpoint()
 
     status, headers, document, _raw = _call(
-        server, "POST", "/v1/chat/completions", _chat()
+        endpoint_server, "POST", "/v1/chat/completions", _chat()
     )
 
     assert status == 200
@@ -699,16 +699,16 @@ def test_a_buffered_completion_is_the_pools_answer_with_the_counts_it_reported(
 
 
 def test_the_conversation_a_tool_sent_is_what_this_machine_signed_for(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
-    """Every turn reaches the center verbatim, under this machine's own identity.
+    """Every turn reaches the server verbatim, under this machine's own identity.
 
     This is the whole claim of the endpoint: a tool needs a base URL and no
-    potluck-specific code, and what the center receives is the conversation the
+    potluck-specific code, and what the server receives is the conversation the
     tool sent plus a signature the tool never sees and cannot make.
     """
-    center.answer_with(deltas=DELTAS)
-    server = endpoint()
+    server.answer_with(deltas=DELTAS)
+    endpoint_server = endpoint()
     conversation = [
         {"role": "system", "content": "answer in one word"},
         {"role": "user", "content": "what settles a request?"},
@@ -716,10 +716,10 @@ def test_the_conversation_a_tool_sent_is_what_this_machine_signed_for(
         {"role": "user", "content": "and what backs the receipt?"},
     ]
 
-    _call(server, "POST", "/v1/chat/completions", _chat(messages=conversation))
+    _call(endpoint_server, "POST", "/v1/chat/completions", _chat(messages=conversation))
 
-    assert len(center.admitted) == 1
-    body = center.admitted[0]
+    assert len(server.admitted) == 1
+    body = server.admitted[0]
     assert body["messages"] == conversation
     assert body["model"] == MODEL
     assert body["delivery_mode"] == "buffered_complete"
@@ -729,34 +729,34 @@ def test_the_conversation_a_tool_sent_is_what_this_machine_signed_for(
     assert body["authorization"]["signer_id"] == SUBJECT
 
 
-def test_a_forwarded_parameter_reaches_the_center_inside_the_signed_body(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+def test_a_forwarded_parameter_reaches_the_server_inside_the_signed_body(
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """What the tool asked for is what the node runs, and what the digest covers."""
-    center.answer_with(deltas=DELTAS)
-    server = endpoint()
+    server.answer_with(deltas=DELTAS)
+    endpoint_server = endpoint()
 
-    _call(server, "POST", "/v1/chat/completions", _chat(max_tokens=64, temperature=1.0))
+    _call(endpoint_server, "POST", "/v1/chat/completions", _chat(max_tokens=64, temperature=1.0))
 
-    assert center.admitted[0]["parameters"] == {"max_tokens": 64, "temperature": 1}
+    assert server.admitted[0]["parameters"] == {"max_tokens": 64, "temperature": 1}
 
 
 def test_every_request_one_endpoint_signs_belongs_to_its_own_single_session(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """One endpoint run is one session, and both shapes report the same one.
 
-    The session is what lets the center aggregate an agent loop's turns and
+    The session is what lets the server aggregate an agent loop's turns and
     prefer the node that served its last one, so the property that matters is
     that a second call does not start a second session. Asserted over both tool
     shapes because they are two doors into the same signing path.
     """
-    center.answer_with(deltas=DELTAS)
-    server = endpoint()
+    server.answer_with(deltas=DELTAS)
+    endpoint_server = endpoint()
 
-    _call(server, "POST", "/v1/chat/completions", _chat())
+    _call(endpoint_server, "POST", "/v1/chat/completions", _chat())
     _call(
-        server,
+        endpoint_server,
         "POST",
         "/v1/messages",
         {
@@ -766,12 +766,12 @@ def test_every_request_one_endpoint_signs_belongs_to_its_own_single_session(
         },
     )
 
-    sessions = [body.get("session_id") for body in center.admitted]
-    assert sessions == [server.session_id, server.session_id]
+    sessions = [body.get("session_id") for body in server.admitted]
+    assert sessions == [endpoint_server.session_id, endpoint_server.session_id]
 
 
 def test_two_endpoint_runs_are_two_sessions(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """A restart is a new session, not a continuation of the one that stopped."""
     first = endpoint()
@@ -781,7 +781,7 @@ def test_two_endpoint_runs_are_two_sessions(
 
 
 def test_a_session_is_a_label_the_signature_does_not_cover(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """The digest is the same with a session as without one.
 
@@ -790,12 +790,12 @@ def test_a_session_is_a_label_the_signature_does_not_cover(
     own sessions, and would buy nothing: the label can only attribute a request
     to a session of the subject the credential already authenticated.
     """
-    center.answer_with(deltas=DELTAS)
-    server = endpoint()
+    server.answer_with(deltas=DELTAS)
+    endpoint_server = endpoint()
 
-    _call(server, "POST", "/v1/chat/completions", _chat(max_tokens=64))
+    _call(endpoint_server, "POST", "/v1/chat/completions", _chat(max_tokens=64))
 
-    body = center.admitted[0]
+    body = server.admitted[0]
     payload = body["authorization"]["payload"]
     assert payload["request_digest"] == compute_request_digest(
         messages=(user_message("what settles a request?"),),
@@ -806,16 +806,16 @@ def test_a_session_is_a_label_the_signature_does_not_cover(
 
 
 def test_a_stream_carries_the_answer_in_pieces_and_ends_with_done(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """The documented OpenAI chunk sequence, including the terminal usage frame.
 
     ``stream_options.include_usage`` is honoured because a client that asked for
     totals reads them from that frame and from nowhere else.
     """
-    center.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134))
-    server = endpoint()
-    connection = _connect(server)
+    server.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134))
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
     try:
         response = _send(
             connection,
@@ -845,16 +845,16 @@ def test_a_stream_carries_the_answer_in_pieces_and_ends_with_done(
 
 
 def test_a_stream_releases_increments_before_the_answer_exists(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """Buffering a stream and calling it streaming is the one lie not to tell.
 
-    The first increment is read off the socket while the center still reports the
+    The first increment is read off the socket while the server still reports the
     request as unfinished, and the rest only after the test lets it finish.
     """
-    center.answer_with(deltas=(DELTAS[0],), hold=True)
-    server = endpoint()
-    connection = _connect(server)
+    server.answer_with(deltas=(DELTAS[0],), hold=True)
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
     try:
         response = _send(
             connection,
@@ -867,10 +867,10 @@ def test_a_stream_releases_increments_before_the_answer_exists(
             {"role": "assistant"},
             {"content": DELTAS[0]},
         ]
-        assert center.last.status == "RUNNING", "nothing had finished yet"
+        assert server.last.status == "RUNNING", "nothing had finished yet"
 
-        center.emit(DELTAS[1])
-        center.finish(billed=99, split=(90, 9))
+        server.emit(DELTAS[1])
+        server.finish(billed=99, split=(90, 9))
         rest = _read_frames(response)
     finally:
         connection.close()
@@ -887,12 +887,12 @@ def test_a_stream_releases_increments_before_the_answer_exists(
 
 
 def test_a_stream_without_a_usage_request_carries_no_usage_frame(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """A totals frame nobody asked for is a frame a client has to explain away."""
-    center.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134))
-    server = endpoint()
-    connection = _connect(server)
+    server.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134))
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
     try:
         response = _send(connection, "POST", "/v1/chat/completions", _chat(stream=True))
         frames = _read_frames(response)
@@ -904,12 +904,12 @@ def test_a_stream_without_a_usage_request_carries_no_usage_frame(
 
 
 def test_the_model_list_is_what_the_connected_nodes_advertise(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """A tool picks a model from this list, so it names the pool and not a catalogue."""
-    server = endpoint()
+    endpoint_server = endpoint()
 
-    status, _headers, document, _raw = _call(server, "GET", "/v1/models")
+    status, _headers, document, _raw = _call(endpoint_server, "GET", "/v1/models")
 
     assert status == 200
     assert document["object"] == "list"
@@ -923,18 +923,18 @@ def test_the_model_list_is_what_the_connected_nodes_advertise(
 
 
 def test_the_anthropic_surface_answers_in_its_own_shape(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """One buffered ``message``, with the platform's own counts and no invented ones.
 
     ``stop_reason`` is ``end_turn`` because the platform carries no upstream stop
     reason back; the one thing a renderer can say is that the answer is complete.
     """
-    center.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134), receipt_id=RECEIPT)
-    server = endpoint()
+    server.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134), receipt_id=RECEIPT)
+    endpoint_server = endpoint()
 
     status, headers, document, _raw = _call(
-        server,
+        endpoint_server,
         "POST",
         "/v1/messages",
         {
@@ -956,14 +956,14 @@ def test_the_anthropic_surface_answers_in_its_own_shape(
     assert headers["x-potluck-receipt-id"] == RECEIPT
     # The reshaping Anthropic's shape needs: its top-level `system` becomes the
     # conversation's first turn, and its required `max_tokens` is forwarded.
-    body = center.admitted[0]
+    body = server.admitted[0]
     assert body["messages"][0] == {"role": "system", "content": "answer in one word"}
     assert body["messages"][1]["role"] == "user"
     assert body["parameters"] == {"max_tokens": 512}
 
 
 def test_the_anthropic_stream_is_the_documented_event_sequence(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """A client that accumulates a streamed message opens its block from the start event.
 
@@ -971,9 +971,9 @@ def test_the_anthropic_stream_is_the_documented_event_sequence(
     document's own ``type`` — and the two agree, because a client reads one of
     them and a debugger reads the other.
     """
-    center.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134))
-    server = endpoint()
-    connection = _connect(server)
+    server.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134))
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
     try:
         response = _send(
             connection,
@@ -1012,21 +1012,21 @@ def test_the_anthropic_stream_is_the_documented_event_sequence(
 
 
 def test_an_anthropic_request_without_max_tokens_gets_a_ceiling_not_a_refusal(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """The API requires the field; a tool that omits it still gets a bounded request."""
-    center.answer_with(deltas=DELTAS)
-    server = endpoint()
+    server.answer_with(deltas=DELTAS)
+    endpoint_server = endpoint()
 
     status, _headers, _document, _raw = _call(
-        server,
+        endpoint_server,
         "POST",
         "/v1/messages",
         {"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
     )
 
     assert status == 200
-    assert center.admitted[0]["parameters"]["max_tokens"] > 0
+    assert server.admitted[0]["parameters"]["max_tokens"] > 0
 
 
 # --------------------------------------------------------------------------- #
@@ -1034,32 +1034,32 @@ def test_an_anthropic_request_without_max_tokens_gets_a_ceiling_not_a_refusal(
 # --------------------------------------------------------------------------- #
 
 
-def test_a_request_the_center_ended_in_failure_is_an_error_naming_the_request(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+def test_a_request_the_server_ended_in_failure_is_an_error_naming_the_request(
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
-    """The center's own reason, the platform's request id, and the way to check the cost.
+    """The server's own reason, the platform's request id, and the way to check the cost.
 
     A FAILED request is settled provisionally, so rendering it as a short answer
     would put "this was free" in front of a caller whose upstream really did burn
     tokens. The ``usage`` block is absent rather than zero for the same reason.
     """
-    center.answer_with(
+    server.answer_with(
         deltas=(),
         status="FAILED",
         receipt_id=RECEIPT,
         billing_note="no node left to take the work: local budget would be exceeded",
     )
-    server = endpoint()
+    endpoint_server = endpoint()
 
     status, headers, document, _raw = _call(
-        server, "POST", "/v1/chat/completions", _chat()
+        endpoint_server, "POST", "/v1/chat/completions", _chat()
     )
 
     assert status == 502
     error = document["error"]
     assert error["code"] == "upstream_failed"
     assert error["type"] == "server_error"
-    assert "no node left to take the work" in error["message"], "the center's own words"
+    assert "no node left to take the work" in error["message"], "the server's own words"
     assert error["request_id"] == headers["x-potluck-request-id"]
     assert "verify receipt" in error["message"]
     assert RECEIPT in error["message"]
@@ -1068,18 +1068,18 @@ def test_a_request_the_center_ended_in_failure_is_an_error_naming_the_request(
 
 
 def test_a_wait_window_that_closed_on_unfinished_work_is_a_deadline(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """``504``, and a message that says the work may still be running and still be billed.
 
     The endpoint stopped waiting; the platform did not stop working. Reporting
     that as an upstream failure would claim an ending nobody observed.
     """
-    center.answer_with(hold=True)
-    server = endpoint(timeout_s=0.6)
+    server.answer_with(hold=True)
+    endpoint_server = endpoint(timeout_s=0.6)
 
     status, headers, document, _raw = _call(
-        server, "POST", "/v1/chat/completions", _chat()
+        endpoint_server, "POST", "/v1/chat/completions", _chat()
     )
 
     assert status == 504
@@ -1092,32 +1092,32 @@ def test_a_wait_window_that_closed_on_unfinished_work_is_a_deadline(
 
 
 def test_a_streaming_wait_that_closes_unfinished_is_a_deadline_too(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """The delivery mode changes the frames, not what the outcome means."""
-    center.answer_with(hold=True)
-    server = endpoint(timeout_s=0.6)
+    server.answer_with(hold=True)
+    endpoint_server = endpoint(timeout_s=0.6)
 
     status, _headers, document, _raw = _call(
-        server, "POST", "/v1/chat/completions", _chat(stream=True)
+        endpoint_server, "POST", "/v1/chat/completions", _chat(stream=True)
     )
 
     assert status == 504, "the stream never opened, so its real status is still available"
     assert document["error"]["code"] == "deadline_passed"
 
 
-def test_a_center_refusal_is_mapped_into_the_callers_own_vocabulary(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+def test_a_server_refusal_is_mapped_into_the_callers_own_vocabulary(
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """An exhausted balance must not read as an outage, in either shape."""
-    center.refuse_with(402, "insufficient_funds", "consumer-X has no credit left")
-    server = endpoint()
+    server.refuse_with(402, "insufficient_funds", "consumer-X has no credit left")
+    endpoint_server = endpoint()
 
     openai_status, _headers, openai_document, _raw = _call(
-        server, "POST", "/v1/chat/completions", _chat()
+        endpoint_server, "POST", "/v1/chat/completions", _chat()
     )
     anthropic_status, _headers, anthropic_document, _raw = _call(
-        server,
+        endpoint_server,
         "POST",
         "/v1/messages",
         {"model": MODEL, "max_tokens": 16,
@@ -1134,7 +1134,7 @@ def test_a_center_refusal_is_mapped_into_the_callers_own_vocabulary(
 
 
 def test_a_failure_after_a_stream_opened_travels_inside_the_stream(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """Once the ``200`` and the SSE head are out there is no status left to send.
 
@@ -1142,13 +1142,13 @@ def test_a_failure_after_a_stream_opened_travels_inside_the_stream(
     a client whose read loop waits for one would otherwise sit on a closed socket
     wondering whether more was coming.
     """
-    center.answer_with(deltas=(DELTAS[0],), hold=True)
-    server = endpoint(timeout_s=60.0)
-    connection = _connect(server)
+    server.answer_with(deltas=(DELTAS[0],), hold=True)
+    endpoint_server = endpoint(timeout_s=60.0)
+    connection = _connect(endpoint_server)
     try:
         response = _send(connection, "POST", "/v1/chat/completions", _chat(stream=True))
         _read_frames(response, limit=2)
-        center.finish(status="FAILED", billing_note="the node stopped answering")
+        server.finish(status="FAILED", billing_note="the node stopped answering")
         frames = _read_frames(response)
     finally:
         connection.close()
@@ -1161,19 +1161,19 @@ def test_a_failure_after_a_stream_opened_travels_inside_the_stream(
 
 
 def test_a_fractional_parameter_is_refused_before_anything_is_signed(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """Every offending parameter at once, in the caller's shape, costing nothing.
 
     The signed path cannot carry a fraction, and silently dropping one would run
     a request the caller did not ask for. The refusal is raised while the body is
-    still being parsed, so no authorization was minted and the center never saw
+    still being parsed, so no authorization was minted and the server never saw
     the request — which is what makes "this cost nothing" a true statement.
     """
-    server = endpoint()
+    endpoint_server = endpoint()
 
     status, _headers, document, _raw = _call(
-        server, "POST", "/v1/chat/completions", _chat(temperature=0.7, top_p=0.9)
+        endpoint_server, "POST", "/v1/chat/completions", _chat(temperature=0.7, top_p=0.9)
     )
 
     assert status == 400
@@ -1182,17 +1182,17 @@ def test_a_fractional_parameter_is_refused_before_anything_is_signed(
     message = document["error"]["message"]
     assert "temperature" in message and "top_p" in message
     assert "/openai/v1" in message, "the surface that can carry a fraction is named"
-    assert center.admitted == []
+    assert server.admitted == []
 
 
 def test_a_fractional_parameter_is_refused_in_anthropics_shape_too(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """Claude Code sends ``temperature``; it reads the error shape it parses."""
-    server = endpoint()
+    endpoint_server = endpoint()
 
     status, _headers, document, _raw = _call(
-        server,
+        endpoint_server,
         "POST",
         "/v1/messages",
         {"model": MODEL, "max_tokens": 16, "temperature": 0.7,
@@ -1203,7 +1203,7 @@ def test_a_fractional_parameter_is_refused_in_anthropics_shape_too(
     assert document["type"] == "error"
     assert document["error"]["type"] == "invalid_request_error"
     assert "temperature" in document["error"]["message"]
-    assert center.admitted == []
+    assert server.admitted == []
 
 
 @pytest.mark.parametrize(
@@ -1216,7 +1216,7 @@ def test_a_fractional_parameter_is_refused_in_anthropics_shape_too(
     ],
 )
 def test_a_route_this_endpoint_does_not_serve_is_refused_not_executed(
-    center: FakeCenter,
+    server: FakeServer,
     endpoint: Callable[..., LocalEndpointServer],
     method: str,
     path: str,
@@ -1229,7 +1229,7 @@ def test_a_route_this_endpoint_does_not_serve_is_refused_not_executed(
     would run it as a completion and spend credit to answer a question about
     counting.
     """
-    server = endpoint()
+    endpoint_server = endpoint()
     document_body = (
         {"model": MODEL, "max_tokens": 16,
          "messages": [{"role": "user", "content": "hi"}]}
@@ -1238,7 +1238,7 @@ def test_a_route_this_endpoint_does_not_serve_is_refused_not_executed(
     )
 
     status, _headers, document, _raw = _call(
-        server, method, path, document_body
+        endpoint_server, method, path, document_body
     )
 
     assert status == 404
@@ -1250,7 +1250,7 @@ def test_a_route_this_endpoint_does_not_serve_is_refused_not_executed(
         assert error["type"] == "not_found_error"
     assert "POST /v1/chat/completions" in error["message"]
     assert "POST /v1/messages" in error["message"]
-    assert center.admitted == []
+    assert server.admitted == []
 
 
 @pytest.mark.parametrize(
@@ -1266,29 +1266,29 @@ def test_a_route_this_endpoint_does_not_serve_is_refused_not_executed(
     ],
 )
 def test_a_body_this_endpoint_cannot_forward_is_a_400_naming_the_problem(
-    center: FakeCenter,
+    server: FakeServer,
     endpoint: Callable[..., LocalEndpointServer],
     raw_body: bytes,
     expected: str,
 ) -> None:
     """A malformed body is answered, not crashed on, and nothing is submitted."""
-    server = endpoint()
+    endpoint_server = endpoint()
 
     status, _headers, document, _raw = _call(
-        server, "POST", "/v1/chat/completions", raw_body=raw_body
+        endpoint_server, "POST", "/v1/chat/completions", raw_body=raw_body
     )
 
     assert status == 400
     assert expected in document["error"]["message"]
-    assert center.admitted == []
+    assert server.admitted == []
 
 
 def test_a_body_with_no_content_length_is_refused_rather_than_half_read(
     endpoint: Callable[..., LocalEndpointServer],
 ) -> None:
     """A body only half read would be signed as something the caller did not send."""
-    server = endpoint()
-    connection = _connect(server)
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
     try:
         connection.putrequest("POST", "/v1/chat/completions")
         connection.putheader("transfer-encoding", "chunked")
@@ -1309,8 +1309,8 @@ def test_a_body_above_the_size_limit_is_refused_by_its_declared_length(
     """Refused on the header, so the bytes are never buffered to find that out."""
     from aipotluck.openai_wire import MAX_BODY_BYTES
 
-    server = endpoint()
-    connection = _connect(server)
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
     try:
         connection.putrequest("POST", "/v1/chat/completions")
         connection.putheader("content-type", "application/json")
@@ -1326,26 +1326,26 @@ def test_a_body_above_the_size_limit_is_refused_by_its_declared_length(
     assert str(MAX_BODY_BYTES) in json.loads(raw)["error"]["message"]
 
 
-def test_a_center_that_cannot_be_reached_is_reported_as_an_upstream_failure(
+def test_a_server_that_cannot_be_reached_is_reported_as_an_upstream_failure(
     tmp_path: Path, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
-    """The identity's center is gone; a tool reads one error document, not a traceback."""
+    """The identity's server is gone; a tool reads one error document, not a traceback."""
     identity = _write_identity(tmp_path / "gone", "http://127.0.0.1:1")
-    server = LocalEndpointServer(
+    endpoint_server = LocalEndpointServer(
         identity=LocalIdentity.load(identity.directory),
         settings=EndpointSettings(port=0, timeout_s=2.0),
     )
-    server.start()
+    endpoint_server.start()
     try:
         status, _headers, document, _raw = _call(
-            server, "POST", "/v1/chat/completions", _chat()
+            endpoint_server, "POST", "/v1/chat/completions", _chat()
         )
     finally:
-        server.stop(grace_s=1.0)
+        endpoint_server.stop(grace_s=1.0)
 
     assert status == 502
     assert document["error"]["code"] == "upstream_failed"
-    assert "center unreachable" in document["error"]["message"]
+    assert "server unreachable" in document["error"]["message"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1354,44 +1354,44 @@ def test_a_center_that_cannot_be_reached_is_reported_as_an_upstream_failure(
 
 
 def test_stopping_the_endpoint_cancels_the_work_it_had_in_flight(
-    center: FakeCenter,
+    server: FakeServer,
     identity: Identity,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A cancel reaches the center, and the caller is answered rather than dropped.
+    """A cancel reaches the server, and the caller is answered rather than dropped.
 
-    The cancel is posted rather than merely abandoned locally because the center
+    The cancel is posted rather than merely abandoned locally because the server
     pushes it on to the node running the work: an interrupted endpoint must not
     leave an upstream generating tokens for an answer nobody will read. The caller
     is still connected, so it is owed a document that says the request was
     cancelled and that what it cost is not knowable from here.
     """
-    center.answer_with(hold=True)
-    server = LocalEndpointServer(
+    server.answer_with(hold=True)
+    endpoint_server = LocalEndpointServer(
         identity=LocalIdentity.load(identity.directory),
         settings=EndpointSettings(port=0, timeout_s=30.0),
     )
-    server.start()
+    endpoint_server.start()
     outcome: list[tuple[int, Any]] = []
 
     def call() -> None:
         status, _headers, document, _raw = _call(
-            server, "POST", "/v1/chat/completions", _chat()
+            endpoint_server, "POST", "/v1/chat/completions", _chat()
         )
         outcome.append((status, document))
 
     thread = threading.Thread(target=call, daemon=True)
     try:
         thread.start()
-        _wait_until(lambda: bool(center.admitted))
-        cancelled = server.stop(grace_s=5.0)
+        _wait_until(lambda: bool(server.admitted))
+        cancelled = endpoint_server.stop(grace_s=5.0)
         thread.join(timeout=10.0)
     finally:
-        if server.running:
-            server.stop(grace_s=1.0)
+        if endpoint_server.running:
+            endpoint_server.stop(grace_s=1.0)
 
     assert cancelled == 1, "one request was in flight and was asked to cancel"
-    assert center.cancels == [center.last.request_id]
+    assert server.cancels == [server.last.request_id]
     assert not thread.is_alive()
     status, document = outcome[0]
     assert status == 503
@@ -1403,25 +1403,25 @@ def test_stopping_the_endpoint_cancels_the_work_it_had_in_flight(
 
 
 def test_a_caller_that_hangs_up_mid_stream_stops_the_work_it_asked_for(
-    center: FakeCenter,
+    server: FakeServer,
     identity: Identity,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A disconnect ends the request at the center, not only the writing of it.
+    """A disconnect ends the request at the server, not only the writing of it.
 
     The tool walked away, so there is nobody to answer; what still matters is that
     no upstream keeps generating tokens for an answer nobody will read. The cancel
-    reaches the center, which pushes it on to the node running the work, and the
+    reaches the server, which pushes it on to the node running the work, and the
     request's one log line says the caller left rather than pretending it was
     served.
     """
-    center.answer_with(deltas=(DELTAS[0],), hold=True)
-    server = LocalEndpointServer(
+    server.answer_with(deltas=(DELTAS[0],), hold=True)
+    endpoint_server = LocalEndpointServer(
         identity=LocalIdentity.load(identity.directory),
         settings=EndpointSettings(port=0, timeout_s=30.0),
     )
-    server.start()
-    connection = _connect(server)
+    endpoint_server.start()
+    connection = _connect(endpoint_server)
     response = _send(connection, "POST", "/v1/chat/completions", _chat(stream=True))
     try:
         assert len(_read_frames(response, limit=2)) == 2, "the answer had started"
@@ -1435,9 +1435,9 @@ def test_a_caller_that_hangs_up_mid_stream_stops_the_work_it_asked_for(
         # Increments nobody is left to read: writing one to a closed socket is how
         # the endpoint discovers the caller is gone.
         for index in range(3):
-            center.emit(f"an increment nobody will read {index}")
-        _wait_until(lambda: bool(center.cancels))
-        assert set(center.cancels) == {center.last.request_id}
+            server.emit(f"an increment nobody will read {index}")
+        _wait_until(lambda: bool(server.cancels))
+        assert set(server.cancels) == {server.last.request_id}
 
         logged = ""
 
@@ -1448,20 +1448,20 @@ def test_a_caller_that_hangs_up_mid_stream_stops_the_work_it_asked_for(
 
         _wait_until(_log_says_the_caller_left)
     finally:
-        server.stop(grace_s=2.0)
+        endpoint_server.stop(grace_s=2.0)
 
 
 def test_a_second_request_on_one_connection_is_answered_on_its_own(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """Keep-alive must not leak one request's state into the next.
 
     An agent loop holds one connection open across many calls, so a handler that
     remembered it had already answered would silently drop the second one.
     """
-    center.answer_with(deltas=DELTAS)
-    server = endpoint()
-    connection = _connect(server)
+    server.answer_with(deltas=DELTAS)
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
     try:
         first = _send(connection, "POST", "/v1/chat/completions", _chat())
         first_body = json.loads(first.read())
@@ -1474,7 +1474,7 @@ def test_a_second_request_on_one_connection_is_answered_on_its_own(
     assert first_body["choices"][0]["message"]["content"] == ANSWER
     assert second_body["choices"][0]["message"]["content"] == ANSWER
     assert first_body["id"] != second_body["id"]
-    assert len(center.admitted) == 2
+    assert len(server.admitted) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -1483,7 +1483,7 @@ def test_a_second_request_on_one_connection_is_answered_on_its_own(
 
 
 def test_no_answer_header_body_or_log_line_carries_the_signing_key(
-    center: FakeCenter,
+    server: FakeServer,
     identity: Identity,
     endpoint: Callable[..., LocalEndpointServer],
     capsys: pytest.CaptureFixture[str],
@@ -1494,17 +1494,17 @@ def test_no_answer_header_body_or_log_line_carries_the_signing_key(
     every header, and its own stdout — because a key that leaks into an access
     log is a key that leaked.
     """
-    center.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134), receipt_id=RECEIPT)
-    server = endpoint()
+    server.answer_with(deltas=DELTAS, billed=1234, split=(1100, 134), receipt_id=RECEIPT)
+    endpoint_server = endpoint()
     surfaces: list[bytes] = []
     for method, path, document in (
         ("POST", "/v1/chat/completions", _chat()),
         ("GET", "/v1/models", None),
         ("POST", "/v1/chat/completions", _chat(temperature=0.7)),
     ):
-        _status, headers, _body, raw = _call(server, method, path, document)
+        _status, headers, _body, raw = _call(endpoint_server, method, path, document)
         surfaces += [raw, str(headers).encode()]
-    connection = _connect(server)
+    connection = _connect(endpoint_server)
     try:
         response = _send(connection, "POST", "/v1/chat/completions", _chat(stream=True))
         surfaces += [response.read(), str(response.headers).encode()]
@@ -1519,7 +1519,7 @@ def test_no_answer_header_body_or_log_line_carries_the_signing_key(
 
 
 def test_the_endpoint_serves_a_tool_that_sends_a_placeholder_key(
-    center: FakeCenter, endpoint: Callable[..., LocalEndpointServer]
+    server: FakeServer, endpoint: Callable[..., LocalEndpointServer]
 ) -> None:
     """No credential is checked, and the placeholder the emitter documents works.
 
@@ -1528,9 +1528,9 @@ def test_the_endpoint_serves_a_tool_that_sends_a_placeholder_key(
     to be accepted — and so has any other value, which is the honest description
     of what loopback binding does and does not buy.
     """
-    center.answer_with(deltas=DELTAS)
-    server = endpoint()
-    connection = _connect(server)
+    server.answer_with(deltas=DELTAS)
+    endpoint_server = endpoint()
+    connection = _connect(endpoint_server)
     try:
         response = _send(
             connection,
@@ -1549,34 +1549,34 @@ def test_the_endpoint_serves_a_tool_that_sends_a_placeholder_key(
 
 
 def test_a_request_the_endpoint_cannot_sign_is_a_local_error_not_an_upstream_one(
-    tmp_path: Path, center: FakeCenter
+    tmp_path: Path, server: FakeServer
 ) -> None:
     """A key that will not sign is reported as this machine's problem.
 
     Nothing was submitted, so nothing can be billed, and saying so is cheaper for
     the operator than a ``502`` that points at the pool.
     """
-    identity = _write_identity(tmp_path / "broken", center.url)
+    identity = _write_identity(tmp_path / "broken", server.url)
     broken = dict(identity.key_document)
     broken["private_key_b64"] = base64_encode(b"too short to be a key")
     (identity.directory / "key.json").write_bytes(canonicalize(broken))
-    server = LocalEndpointServer(
+    endpoint_server = LocalEndpointServer(
         identity=LocalIdentity.load(identity.directory),
         settings=EndpointSettings(port=0),
     )
-    server.start()
+    endpoint_server.start()
     try:
         status, _headers, document, _raw = _call(
-            server, "POST", "/v1/chat/completions", _chat()
+            endpoint_server, "POST", "/v1/chat/completions", _chat()
         )
     finally:
-        server.stop(grace_s=1.0)
+        endpoint_server.stop(grace_s=1.0)
 
     assert status == 500
     assert document["error"]["code"] == "internal_error"
     assert "could not sign this request" in document["error"]["message"]
     assert str(identity.directory) in document["error"]["message"]
-    assert center.admitted == []
+    assert server.admitted == []
 
 
 # --------------------------------------------------------------------------- #
@@ -1585,7 +1585,7 @@ def test_a_request_the_endpoint_cannot_sign_is_a_local_error_not_an_upstream_one
 
 
 def test_the_emitted_configuration_is_a_configuration_that_works(
-    center: FakeCenter,
+    server: FakeServer,
     endpoint: Callable[..., LocalEndpointServer],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1599,13 +1599,13 @@ def test_the_emitted_configuration_is_a_configuration_that_works(
     down again, so this test cannot pass on a configuration that a tool would
     read differently.
     """
-    center.answer_with(deltas=DELTAS)
-    server = endpoint()
+    server.answer_with(deltas=DELTAS)
+    endpoint_server = endpoint()
 
-    assert main(["config", "emit", "--shell", "--port", str(server.port)]) == 0
+    assert main(["config", "emit", "--shell", "--port", str(endpoint_server.port)]) == 0
     shell_block = capsys.readouterr().out
     assert main(
-        ["config", "emit", "--claude-code", "--port", str(server.port), "--model", MODEL]
+        ["config", "emit", "--claude-code", "--port", str(endpoint_server.port), "--model", MODEL]
     ) == 0
     claude_document = json.loads(capsys.readouterr().out)
 
@@ -1617,18 +1617,18 @@ def test_the_emitted_configuration_is_a_configuration_that_works(
         exported[name] = value.strip('"')
     openai_base = exported["OPENAI_BASE_URL"]
     anthropic_base = claude_document["env"]["ANTHROPIC_BASE_URL"]
-    assert openai_base == server.base_url, "the emitter and the endpoint agree"
-    assert anthropic_base == server.anthropic_base_url
+    assert openai_base == endpoint_server.base_url, "the emitter and the endpoint agree"
+    assert anthropic_base == endpoint_server.anthropic_base_url
     assert exported["OPENAI_API_KEY"] == LOCAL_API_KEY_PLACEHOLDER
 
     openai_route = f"{urlsplit(openai_base).path}/chat/completions"
-    status, _headers, document, _raw = _call(server, "POST", openai_route, _chat())
+    status, _headers, document, _raw = _call(endpoint_server, "POST", openai_route, _chat())
     assert status == 200
     assert document["choices"][0]["message"]["content"] == ANSWER
 
     anthropic_route = f"{urlsplit(anthropic_base).path}/v1/messages"
     status, _headers, document, _raw = _call(
-        server,
+        endpoint_server,
         "POST",
         anthropic_route,
         {"model": MODEL, "max_tokens": 64,
@@ -1639,8 +1639,8 @@ def test_the_emitted_configuration_is_a_configuration_that_works(
     assert claude_document["env"]["ANTHROPIC_MODEL"] == MODEL
 
     status, _headers, document, _raw = _call(
-        server, "GET", f"{urlsplit(openai_base).path}/models"
+        endpoint_server, "GET", f"{urlsplit(openai_base).path}/models"
     )
     assert status == 200
     assert [model["id"] for model in document["data"]] == [MODEL]
-    assert len(center.admitted) == 2, "one request per completion route, none for the list"
+    assert len(server.admitted) == 2, "one request per completion route, none for the list"

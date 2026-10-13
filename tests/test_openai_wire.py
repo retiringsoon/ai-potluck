@@ -163,7 +163,7 @@ def test_every_fractional_parameter_is_refused_at_once_before_anything_is_signed
     Reported one per round trip, a caller would fix a body four times for one
     mistake. The refusal is raised while the body is still being parsed, so no
     authorization is minted and nothing is billed; the message names the
-    center's own OpenAI-compatible surface, which parses a tool's body with the
+    server's own OpenAI-compatible surface, which parses a tool's body with the
     standard library and therefore *can* forward a fraction.
     """
     with pytest.raises(UnforwardableParameterError) as raised:

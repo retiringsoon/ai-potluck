@@ -3,7 +3,7 @@
 Why this lives in the client package: the contributor's connector builds and
 signs its usage report through this module, and receipt verification recomputes
 a settlement from it — construction and re-checking are protocol primitives.
-Center bookkeeping and the gateway live in ``ai-potluck-server``, which imports
+Server bookkeeping and the gateway live in ``ai-potluck-server``, which imports
 the same engine to keep its own books.
 
 The order of operations is the security-relevant part. The ledger transaction

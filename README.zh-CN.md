@@ -17,14 +17,14 @@ ai-potluck 把这套握手变成基础设施：
   没有押金，没有共享 key。
 - **每笔消耗都可证明**：每个回答产生签名收据与透明日志条目，任何人都能离线核验
   （`potluck verify receipt`）——连中断的工作也是对账处理，而不是拍脑袋估计。
-- **中心管账，但不掌权**：中心负责路由、计量与结算；它看不到上游凭据，任何人
+- **中心服务器管账，但不掌权**：中心服务器负责路由、计量与结算；它看不到上游凭据，任何人
   都可以拿公开账本复核它的算术。
 
 供给采取邀请制与知情同意——见[供给合规](#供给合规)。
 
 
 本仓库是客户端：`potluck` 命令、Connector，以及协议与验证核心。模块划分只有一条
-规则——协议与验证原语放在 ai-potluck，客户端无需信任中心即可核验收据；中心记账与
+规则——协议与验证原语放在 ai-potluck，客户端无需信任中心服务器即可核验收据；中心服务器记账与
 网关放在伴生仓库 [`ai-potluck-server`](../ai-potluck-server)（`potluck-server`），
 它依赖本包，并从 ai-potluck 导入验证原语来做自己的账。
 
@@ -100,11 +100,11 @@ AI potluck 是一张共享的桌子：贡献者拿出自己有权转售的 AI �
 找运营者要一个邀请码，然后：
 
 ```bash
-potluck join --center http://host:port --invite CODE
+potluck join --server http://host:port --invite CODE
 potluck ask "你的问题" --stream
 ```
 
-`join` 在本机生成 Ed25519 密钥（0600），在中心兑换邀请码，把身份存到
+`join` 在本机生成 Ed25519 密钥（0600），在中心服务器兑换邀请码，把身份存到
 `~/.aipotluck`——之后的命令都不需要再配置。邀请码自带少量 milli-credit 额度；
 `ask --stream` 逐段显示回答。真实输出如下（回答文本与数字为示意）：
 
@@ -123,7 +123,7 @@ potluck: cost 38 milli-credit (38 tokens, receipt R-1)
 
 两条入口，区别在于"谁证明了这笔消耗获得授权"。
 
-**中心的 OpenAI 端点** —— 即插即用路径。中心提供
+**中心服务器的 OpenAI 端点** —— 即插即用路径。中心服务器提供
 `POST /openai/v1/chat/completions` 与 `GET /openai/v1/models`，用运营者为你的
 消费者身份铸造的 API key 认证：
 
@@ -131,11 +131,11 @@ potluck: cost 38 milli-credit (38 tokens, receipt R-1)
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://<center>/openai/v1",   # 中心，不是供应商
+    base_url="https://<server>/openai/v1",   # 中心服务器，不是供应商
     api_key="ak-…",                          # potluck-server admin api-key
 ```
 
-中心用它自己的结算密钥签署所准入的条款（`gateway_authenticated`），这条路径的
+中心服务器用它自己的结算密钥签署所准入的条款（`gateway_authenticated`），这条路径的
 收据可以诚实通过验证，同时如实标注这是弱于你自己签名的授权方式——文档保留这一
 区分，不把它模糊掉。
 
@@ -145,7 +145,7 @@ client = OpenAI(
 - `POST /v1/chat/completions` 与 `GET /v1/models`（OpenAI 形状）
 - `POST /v1/messages`（Anthropic 形状——Claude Code 无需改造即可用）
 
-每个请求都用本机 `~/.aipotluck` 身份签名；不存在可泄漏的中心签发 key，花钱的
+每个请求都用本机 `~/.aipotluck` 身份签名；不存在可泄漏的中心服务器签发 key，花钱的
 决定权从不离开你的手——与贡献者的 Connector 自持凭据完全对称。
 
 ```bash
@@ -161,9 +161,9 @@ potluck config emit --claude-code   # 即贴即用的 settings.json env 块
 
 ### 需要知道的
 
-- **按量付费，没有月费**：邀请码额度就是全部预算，超额工作中心直接拒绝。
+- **按量付费，没有月费**：邀请码额度就是全部预算，超额工作中心服务器直接拒绝。
 - **中断的回答不会变成糊涂账**：节点中途消失时该次尝试标记为 *usage to be
-  confirmed*，由中心对账——没人能拿出依据的数字不会扣到你头上。
+  confirmed*，由中心服务器对账——没人能拿出依据的数字不会扣到你头上。
 - **你的 prompt 对贡献节点可见**（模型在它那里跑）。详见
   [信任模型](#信任模型)与[供给合规](#供给合规)。
 
@@ -173,7 +173,7 @@ potluck config emit --claude-code   # 即贴即用的 settings.json env 块
 `node` 邀请码，然后：
 
 ```bash
-potluck join --node --center http://host:port --invite CODE \
+potluck join --node --server http://host:port --invite CODE \
   --upstream-endpoint https://api.example/v1/chat/completions \
   --upstream-model MODEL \
   --upstream-key-file ./key
@@ -191,30 +191,30 @@ base URL——connector 会直接 POST 到你给的地址。
 本机行为：
 
 - 上游 key 只存在本机 `node.json`（0600），不上传、不打印。
-- 向导自检只做 TCP 连通性探测（上游与中心），不发送凭据；加
+- 向导自检只做 TCP 连通性探测（上游与中心服务器），不发送凭据；加
   `--probe-upstream-live` 才会向上游发一次真实、计费的请求。
 - 密钥从文件或环境变量（`AIPOTLUCK_UPSTREAM_KEY`）读取，不走命令行参数——命令行
   参数对同机所有进程可见。
 
-## 运行自己的中心
+## 运行自己的中心服务器
 
-中心是单进程 + 内嵌 SQLite，不需要外部数据库。中心随伴生仓库
+中心服务器是单进程 + 内嵌 SQLite，不需要外部数据库。中心服务器随伴生仓库
 `ai-potluck-server` 发布，它依赖本包。部署（TLS、守护进程、隧道）见
-[docs/center-deployment.md](docs/center-deployment.md)。
+[docs/server-deployment.md](docs/server-deployment.md)。
 
 ```bash
 uv pip install ai-potluck-server   # 或：-e <ai-potluck-server checkout>
-potluck-server serve --config center.json
+potluck-server serve --config server.json
 ```
 
-邀请码必须在中心机上签发（那里有 store 文件）：
+邀请码必须在中心服务器上签发（那里有 store 文件）：
 
 ```bash
-potluck-server admin invite --config center.json --role consumer --tenant friends
-potluck-server admin invite --config center.json --role node --tenant friends
+potluck-server admin invite --config server.json --role consumer --tenant friends
+potluck-server admin invite --config server.json --role node --tenant friends
 ```
 
-邀请码只显示一次，中心只存摘要。
+邀请码只显示一次，中心服务器只存摘要。
 
 ## 信任模型
 
@@ -239,17 +239,17 @@ potluck-server admin invite --config center.json --role node --tenant friends
 potluck verify receipt --receipt-id R-1
 potluck verify receipt --receipt-id R-1 --json
 
-# 运营者——对中心自己的数据库做同一套核验；中心还存有签名的用量报告，
+# 运营者——对中心服务器自己的数据库做同一套核验；中心服务器还存有签名的用量报告，
 # 所以五个判定都能评估
-potluck-server verify receipt --config center.json --receipt-id R-1
+potluck-server verify receipt --config server.json --receipt-id R-1
 
-# 贡献者——把 node.db 与中心派发给本节点的 attempt 对账
+# 贡献者——把 node.db 与中心服务器派发给本节点的 attempt 对账
 # （节点配置默认 ~/.aipotluck/node.json）
 potluck share reconcile
 
 # 运营者——把 attempts、settlements、receipts、透明日志叶子与账本重放日志
-# 双向交叉核对。--config 必填：这个命令读的是中心自己的数据库
-potluck-server admin reconcile --config center.json
+# 双向交叉核对。--config 必填：这个命令读的是中心服务器自己的数据库
+potluck-server admin reconcile --config server.json
 ```
 
 `verify receipt` 分开报告五个判定——`signature_valid`、`metering_provenance`、
@@ -260,13 +260,13 @@ potluck-server admin reconcile --config center.json
 `unknown`，因为消费者手上没有签名的用量报告。两个对账命令在记录一致时退出 0，
 存在任何差异时退出 1。
 
-消费者经 HTTP 核验时，平台结算公钥来自提供收据的同一个中心——这能发现日志丢失
-或乱序，但发现不了“中心重写历史后重新签名”。把 `GET /v1/checkpoint` 的
+消费者经 HTTP 核验时，平台结算公钥来自提供收据的同一个中心服务器——这能发现日志丢失
+或乱序，但发现不了“中心服务器重写历史后重新签名”。把 `GET /v1/checkpoint` 的
 `public_key_b64` 带外固定下来，才能封住这个缺口。
 
 ## 代理环境
 
-出站连接（ask/request 到中心、节点 WebSocket、节点到上游）遵循标准代理变量：
+出站连接（ask/request 到中心服务器、节点 WebSocket、节点到上游）遵循标准代理变量：
 
 ```bash
 HTTPS_PROXY=http://127.0.0.1:7897 potluck ask "你好" --stream
@@ -288,7 +288,7 @@ HTTPS_PROXY=http://127.0.0.1:7897 potluck ask "你好" --stream
 
 - 邀请制加入。
 - 无充值、无提现：credit 由运营者铸造，无法兑现。
-- 单中心、单实例——无联邦、无高可用。
+- 单中心服务器、单实例——无联邦、无高可用。
 - 只支持[支持环境](#支持环境)里列出的组合；原生不支持 Windows，请用 WSL2。
 
 ## 开发
@@ -303,7 +303,7 @@ uv pip install -e ".[dev]"
 .venv/bin/mypy
 ```
 
-端到端发布门禁——真实安装 + 默认 join/ask 路径 + 真实中心——在
+端到端发布门禁——真实安装 + 默认 join/ask 路径 + 真实中心服务器——在
 `ai-potluck-server` 仓库的 `scripts/release_gate.sh`，因为它同时驱动两个包。
 
 只有在会拦截 pytest 在系统临时目录建目录的沙箱里才需要 `--basetemp`；普通环境
@@ -315,4 +315,4 @@ uv pip install -e ".[dev]"
 - [路线图](docs/ROADMAP.md)
 - [Proposal & early-user asks (English)](docs/PROPOSAL.md)
 - [网络契约 v0.1](docs/network-contract-v0.1.md)
-- [中心部署](docs/center-deployment.md)
+- [中心服务器部署](docs/server-deployment.md)

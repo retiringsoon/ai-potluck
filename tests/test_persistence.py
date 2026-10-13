@@ -1,7 +1,7 @@
 """The contribution node's durable store.
 
-The center store's own suite lives in the ``ai-potluck-server`` repository,
-beside ``CenterStore``; what is covered here is the node half of the shared
+The server store's own suite lives in the ``ai-potluck-server`` repository,
+beside ``ServerStore``; what is covered here is the node half of the shared
 plumbing: the execution guard that makes a reconnect unable to issue a second
 upstream call, the spool and its acknowledgement cursor, node metadata, and
 the open-existing refusal that keeps a lost ``node.db`` from being rebuilt as

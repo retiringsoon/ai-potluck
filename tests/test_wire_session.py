@@ -1,7 +1,7 @@
 """The session identifier the request model carries.
 
 A session is a *label*, not a credential and not part of the work: it says which
-run of an agent loop a request belongs to so the center can aggregate that run's
+run of an agent loop a request belongs to so the server can aggregate that run's
 cost and prefer the node that served its last turn. Two properties are worth
 pinning here, because both are easy to get subtly wrong:
 
@@ -62,7 +62,7 @@ def test_a_session_identifier_that_cannot_travel_or_print_is_refused(value: str)
     """An empty, over-long, whitespace-bearing or control-bearing id is refused.
 
     Refused rather than trimmed or dropped: a caller that asked for a session and
-    was silently given none would read the center's aggregate for a run it never
+    was silently given none would read the server's aggregate for a run it never
     joined.
     """
     with pytest.raises(ProtocolError):

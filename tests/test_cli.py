@@ -3,11 +3,11 @@
 These tests drive ``main()`` rather than the private command helpers, so the
 argument wiring, the stdout/stderr split and the exit codes are exercised the
 same way the installed ``potluck`` script uses them. The consumer network
-commands that need a running center live in the ``ai-potluck-server``
-repository's suite, beside the center they drive against.
+commands that need a running server live in the ``ai-potluck-server``
+repository's suite, beside the server they drive against.
 
 :func:`aipotluck.cli.build_signed_request` is tested here even though it belongs
-to the consumer path: minting a request needs no center, and it is the one seam
+to the consumer path: minting a request needs no server, and it is the one seam
 ``ask`` and ``serve-openai`` share, so what it signs is a question this suite can
 answer offline.
 """
@@ -240,7 +240,7 @@ def test_request_without_auth_file_fails_with_actionable_message(
     """The failure happens before any network traffic and names the remedy."""
     consumer_config = tmp_path / "consumer.json"
     consumer_config.write_text(
-        json.dumps({"center_url": "http://127.0.0.1:1", "token": CONSUMER_TOKEN}),
+        json.dumps({"server_url": "http://127.0.0.1:1", "token": CONSUMER_TOKEN}),
         encoding="utf-8",
     )
     code = main(_request_argv(consumer_config, None))
@@ -251,8 +251,6 @@ def test_request_without_auth_file_fails_with_actionable_message(
     assert "--auth-file" in message
     assert "potluck sign" in message
     assert "consumer key" in message
-
-
 
 
 def _public_key(public_key_b64: str) -> Ed25519PublicKey:
@@ -269,7 +267,7 @@ def _identity_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
     """
     public_key_b64, private_key_b64 = generate_key_pair()
     config_document = {
-        "center_url": "http://127.0.0.1:1",
+        "server_url": "http://127.0.0.1:1",
         "key_id": "consumer-key-1",
         "subject_id": "consumer-X",
         "tenant_id": "tenant-1",
@@ -306,7 +304,7 @@ def _signed(
 def test_build_signed_request_submits_the_conversation_and_parameters_it_signs() -> None:
     """Every turn and every forwarded parameter is in the body *and* the digest.
 
-    The center re-derives the digest from what was submitted and refuses a
+    The server re-derives the digest from what was submitted and refuses a
     mismatch, so a body field the signature does not cover is a field a caller
     could change after signing. Asserting the digest equals one recomputed from
     the same values is what pins the two together.
@@ -325,7 +323,7 @@ def test_build_signed_request_submits_the_conversation_and_parameters_it_signs()
     )
 
     assert body["messages"] == [message.to_payload() for message in messages], (
-        "the conversation reaches the center turn by turn, not as one prompt"
+        "the conversation reaches the server turn by turn, not as one prompt"
     )
     assert body["parameters"] == {"max_tokens": 64, "seed": 7, "stop": ["END"]}
     assert body["model"] == MODEL
@@ -373,7 +371,7 @@ def test_a_different_parameter_set_signs_a_different_request() -> None:
 def test_a_session_travels_in_the_body_and_stays_out_of_the_signature() -> None:
     """One session names a run; the digest still covers only the work.
 
-    Both halves matter. The body has to carry the identifier or the center cannot
+    Both halves matter. The body has to carry the identifier or the server cannot
     attribute the turn, and the digest has to be *unchanged* by it or a caller
     would have to re-sign to move a turn between its own sessions.
     """
@@ -405,7 +403,7 @@ def test_a_session_travels_in_the_body_and_stays_out_of_the_signature() -> None:
 
 
 def test_a_session_identifier_the_wire_refuses_is_refused_before_signing() -> None:
-    """A bad identifier fails locally rather than at the center's boundary."""
+    """A bad identifier fails locally rather than at the server's boundary."""
     config_document, key_document, _ = _identity_documents()
 
     with pytest.raises(ProtocolError):
