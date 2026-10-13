@@ -11,7 +11,11 @@ somewhere along the signed path.
 import pytest
 
 from aipotluck.errors import ProtocolError
-from aipotluck.wire import compute_request_digest, encode_chat_parameters
+from aipotluck.wire import (
+    compute_request_digest,
+    decode_chat_parameters,
+    encode_chat_parameters,
+)
 
 
 def test_fraction_encodes_to_a_decimal_string() -> None:
@@ -52,3 +56,39 @@ def test_digest_is_stable_across_representations() -> None:
 def test_invalid_values_fail_loud(bad: object) -> None:
     with pytest.raises(ProtocolError, match="temperature"):
         encode_chat_parameters({"temperature": bad})
+
+
+def test_decoding_restores_the_upstream_body() -> None:
+    """The node's decode is the consumer's encode, read backwards."""
+    encoded = encode_chat_parameters(
+        {"temperature": 0.7, "top_p": 1, "max_tokens": 64, "stop": ["END"]}
+    )
+
+    assert decode_chat_parameters(encoded) == {
+        "temperature": 0.7,
+        "top_p": 1,
+        "max_tokens": 64,
+        "stop": ["END"],
+    }
+
+
+def test_decoding_drops_what_the_platform_never_honoured() -> None:
+    """The node filters the same set the consumer encoder filtered.
+
+    The encoder already drops these, so honest traffic never carries them; the
+    node-side filter is the contributor's guard against a center that injects
+    them anyway. A forwarded ``model``, ``messages`` or ``stream`` reaching the
+    adapter's merge would redirect the contributor's credential at a request
+    the consumer never signed, and an upstream-specific field would become an
+    undocumented way to change what the node asks its provider for.
+    """
+    injected = {
+        "temperature": 0.5,
+        "model": "someone-elses-model",
+        "messages": [{"role": "user", "content": "replaced"}],
+        "stream": False,
+        "stream_options": {"include_usage": True},
+        "tools": [{"type": "function"}],
+    }
+
+    assert decode_chat_parameters(injected) == {"temperature": 0.5}

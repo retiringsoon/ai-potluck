@@ -91,6 +91,34 @@ def test_record_upstream_call_unknown_execution_raises(node: NodeStore) -> None:
         node.record_upstream_call("ghost")
 
 
+def test_a_finished_execution_refuses_a_second_verdict(node: NodeStore) -> None:
+    """A terminal verdict is written once; a second writer loses loudly.
+
+    A CANCEL on the socket loop and a completion on the worker thread can reach
+    the same row at the same moment. The store lets the first verdict stand and
+    refuses the second, so an attempt the server cancelled can never be
+    reported as submitted — the books stay honest whichever way the race
+    resolves, and the refusal names both states so the loser is diagnosable.
+    """
+    node.begin_execution(
+        attempt_id="A1", request_id="R1", epoch=0, request_digest="sha256:d1", at=T0
+    )
+    node.finish_execution("A1", "FAILED", at=T1)
+
+    with pytest.raises(StateTransitionError) as excinfo:
+        node.finish_execution("A1", "SUBMITTED", at=T2)
+
+    message = str(excinfo.value)
+    assert "already finished as FAILED" in message
+    assert "SUBMITTED" in message
+    assert node.get_execution("A1").state == "FAILED"
+
+    # An execution that does not exist is still its own distinct error.
+    with pytest.raises(StateTransitionError) as ghost:
+        node.finish_execution("ghost", "FAILED", at=T1)
+    assert "unknown execution" in str(ghost.value)
+
+
 def test_mark_interrupted_as_unknown_flips_only_submitting(node: NodeStore) -> None:
     node.begin_execution(
         attempt_id="A1", request_id="R1", epoch=0, request_digest="d", at=T0
