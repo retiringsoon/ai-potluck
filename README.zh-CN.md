@@ -119,13 +119,32 @@ potluck: cost 38 milli-credit (38 tokens, receipt R-1)
 费用行列出 token 计数与记录这笔费用的收据。不加 `--stream` 时为缓冲模式：先显示
 `waiting for generation...`，再一次性打印完整回答。加 `--json` 输出单个机器可读文档。
 
+有些邀请还附带一把用于中心服务器 OpenAI 兼容端点的 API key（运营者用
+`--with-api-key` 签发）。如果你的邀请带了，`join` 会把 key 单独一行打印一次，
+并给出它对应的 `base_url`：
+
+```
+potluck: joined as consumer-1a2b3c (role consumer, tenant t-1a2b3c, key consumer-1a2b3c); identity saved to ~/.aipotluck
+ak-Qm9…
+potluck: this invite also issued an API key for the OpenAI-compatible endpoint (the key is the line above this one):
+  base_url: http://host:port/openai/v1
+  shown once; store it now — the server stored only its digest, so a lost key is
+  replaced by the operator, never recovered
+```
+
+`join` 不会把这把 key 写进文件：本 CLI 自己跑的命令都不需要它（`ask` 与
+`serve-openai` 用已保存的身份签名），所以唯一的副本就是你自己存下的那一份。
+把工具指向那个 `base_url`、填上这把 key，它的每个请求都按问题从你自己的账户扣费，
+并且每笔都留有收据。
+
 ### 在自己的工具里使用
 
 两条入口，区别在于"谁证明了这笔消耗获得授权"。
 
 **中心服务器的 OpenAI 端点** —— 即插即用路径。中心服务器提供
-`POST /openai/v1/chat/completions` 与 `GET /openai/v1/models`，用运营者为你的
-消费者身份铸造的 API key 认证：
+`POST /openai/v1/chat/completions` 与 `GET /openai/v1/models`，用一把属于你消费者
+身份的 API key 认证——它可能是运营者为你铸造的，也可能是你执行 `join` 时邀请码
+当场交给你的：
 
 ```python
 from openai import OpenAI
@@ -212,9 +231,12 @@ potluck-server serve --config server.json
 ```bash
 potluck-server admin invite --config server.json --role consumer --tenant friends
 potluck-server admin invite --config server.json --role node --tenant friends
+potluck-server admin invite --config server.json --role consumer --with-api-key --quota 500000
 ```
 
-邀请码只显示一次，中心服务器只存摘要。
+邀请码只显示一次，中心服务器只存摘要。加 `--with-api-key` 后，兑换该码的那次
+`join` 会顺带交给加入者一把 OpenAI 端点的 API key：在这一刻才铸造（此前不存在）、
+上限就是 `--quota`、可以单独撤销，并由 `potluck join` 只显示一次。
 
 ## 信任模型
 

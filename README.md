@@ -138,13 +138,32 @@ Without `--stream`, `ask` buffers: it waits, shows a `waiting for generation...`
 prints the whole answer at once. Add `--json` for a single machine-readable
 document.
 
+Some invites also carry an API key for the server's OpenAI-compatible endpoint
+(an operator mints those with `--with-api-key`). If yours did, `join` prints the
+key once, on its own line, with the `base_url` it belongs to:
+
+```
+potluck: joined as consumer-1a2b3c (role consumer, tenant t-1a2b3c, key consumer-1a2b3c); identity saved to ~/.aipotluck
+ak-Qm9…
+potluck: this invite also issued an API key for the OpenAI-compatible endpoint (the key is the line above this one):
+  base_url: http://host:port/openai/v1
+  shown once; store it now — the server stored only its digest, so a lost key is
+  replaced by the operator, never recovered
+```
+
+`join` does not write that key to a file: nothing this CLI runs needs one (`ask`
+and `serve-openai` sign with the identity it already saved), so the only copy is
+the one you store. Point a tool at that `base_url` with the key and every request
+it makes spends your own account, per question, with a receipt behind it.
+
 ### Using it from your own tools
 
 Two ways in, and they differ in what proves the spend was authorized.
 
 **The server's OpenAI endpoint** — the drop-in path. The server serves
 `POST /openai/v1/chat/completions` and `GET /openai/v1/models`, authenticated
-with an API key the operator mints for your consumer identity:
+with an API key for your consumer identity — one the operator minted for you, or
+one your invite handed you when you ran `join`:
 
 ```python
 from openai import OpenAI
@@ -243,9 +262,13 @@ Mint invite codes on the server machine, where the store file lives:
 ```bash
 potluck-server admin invite --config server.json --role consumer --tenant main
 potluck-server admin invite --config server.json --role node --tenant main
+potluck-server admin invite --config server.json --role consumer --with-api-key --quota 500000
 ```
 
-A code is printed once; only its digest is stored.
+A code is printed once; only its digest is stored. `--with-api-key` makes the
+`join` that redeems the code hand the joiner an API key for the OpenAI endpoint
+as well: minted at that moment and not before, capped by `--quota`, revocable on
+its own, and shown once by `potluck join`.
 
 ## Trust model
 

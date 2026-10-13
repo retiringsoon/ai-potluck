@@ -281,11 +281,12 @@ potluck-server admin invite --config ~/server/server.json --role node           
 
 - 选项默认值：`--role consumer`（或 `node`）、`--tenant auto`（每位加入者一个服务器派生的私有租户）、`--quota 20000`（首次加入铸入的 milli-credit）、`--expires-in 7d`、`--max-uses 1`。
 - 邀请码只在 stdout 打印一次，库里只存摘要；丢了就重新开一个。
+- `--with-api-key`（仅 `--role consumer`）：兑换该码的那次 `join` 当场为加入者铸一把 OpenAI 兼容端点的 API key，上限就是 `--quota`，明文只在 `potluck join` 的输出里出现一次（客户端不落盘）。key 在兑换时刻才存在：未被兑换的邀请码即使泄露也只是“能加入”，没有任何花钱能力；`--role node --with-api-key` 与 `--with-api-key --quota 0` 会在命令处被拒，因为它们只能铸出一把能认证但永远无法结算的 key。key 与身份相互独立：`admin api-key-revoke --key-id <id>` 只撤这把 key（身份照常签名、余额不动），`admin revoke-key` 撤身份则连带撤它名下所有 key。`admin invite-list` 用 `api-key=yes|no` 标出哪些邀请带这个标记。
 - `admin invite-list`（脱敏列表）、`admin revoke-key <key_id>`（撤销，立即在运行中的中心服务器生效，无需重启）。
-- `admin api-key --deadline-ms <毫秒>`（可选）：给一把 key 上的每个请求更长的墙钟预算，用于 agent 长任务。不写则用 OpenAI 面自己的默认值。它延长的是**请求**，不是 HTTP 连接——该面的等待窗口约 110s，超过就答 `504` 并带上 request id，中心服务器仍会把这一轮跑完，事后用 `verify receipt` 取回。详见 `ai-potluck-server/docs/openai-endpoint.md`。
+- `admin api-key --deadline-ms <毫秒>`（可选）：给一把 key 上的每个请求更长的墙钟预算，用于 agent 长任务。`join` 铸出的 key 不带自己的 deadline（用该面默认值）也不带过期时间，需要长窗口的成员请另用本命令铸一把。不写则用 OpenAI 面自己的默认值。它延长的是**请求**，不是 HTTP 连接——该面的等待窗口约 110s，超过就答 `504` 并带上 request id，中心服务器仍会把这一轮跑完，事后用 `verify receipt` 取回。详见 `ai-potluck-server/docs/openai-endpoint.md`。
 - `admin session-list [--subject <id>]` / `admin session-show --session <id>`：按 agent 会话聚合的请求数、原生 token 数、milli-credit 与最后服务的节点；`session-show` 还会列出该会话每个请求背后的收据 id，逐个都能用 `verify receipt` 单独校验。会话由调用方声明（OpenAI 面的 `x-potluck-session` 头、签名路径的 `session_id` 字段），`potluck serve-openai` 会自动为自己这一次运行生成一个并在启动时打印。
 - `serve` 正在运行时也可以执行这些命令：SQLite 用 WAL + 5s busy_timeout，读写互不阻塞。
-- 把码给朋友：消费者 `potluck join --server https://server.example.com --invite <码>`；节点 `potluck join --server … --invite <码> --node`（`--node` 会顺带跑贡献者向导）。
+- 把码给朋友：消费者 `potluck join --server https://server.example.com --invite <码>`；节点 `potluck join --server … --invite <码> --node`（`--node` 会顺带跑贡献者向导）。带 `--with-api-key` 的码会让 `join` 多打印一行 `ak-…`，提醒对方当场存下（只显示一次，库里只存摘要）；重跑 `join` 不会再显示。
 
 ## 8. 升级
 
