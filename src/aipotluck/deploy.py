@@ -355,6 +355,79 @@ def reject_renamed_keys(document: Mapping[str, Any], context: str) -> None:
             )
 
 
+#: Top-level keys a ``node.json`` document may carry. The upstream credential
+#: lives one level down, inside the adapter block.
+NODE_CONFIG_KEYS: Final = frozenset(
+    {
+        "server_url",
+        "node_id",
+        "device_id",
+        "device_key_id",
+        "provider_id",
+        "database_path",
+        "token",
+        "device_private_key_b64",
+        "share_enabled",
+        "max_concurrency",
+        "max_local_reserved_milli_credits",
+        "adapter",
+    }
+)
+
+#: Keys the adapter block of a ``node.json`` document may carry.
+ADAPTER_CONFIG_KEYS: Final = frozenset(
+    {"kind", "endpoint", "api_key", "model", "provider_style", "name", "max_tokens"}
+)
+
+#: Top-level keys a ``consumer.json`` connection document may carry.
+CONSUMER_CONFIG_KEYS: Final = frozenset({"server_url", "token"})
+
+#: Top-level keys the identity config ``potluck join`` writes may carry. The
+#: device ids are optional: an idempotent re-join keeps the ones already on
+#: disk rather than dropping the binding ``share setup`` needs.
+IDENTITY_CONFIG_KEYS: Final = frozenset(
+    {
+        "server_url",
+        "key_id",
+        "subject_id",
+        "tenant_id",
+        "role",
+        "device_id",
+        "device_key_id",
+        "provider_id",
+    }
+)
+
+
+def reject_unknown_keys(
+    document: Mapping[str, Any], allowed: frozenset[str], context: str
+) -> None:
+    """Refuse a configuration document carrying a key outside `allowed`.
+
+    A misspelled key is otherwise read as an absent one and the default
+    silently applies — a ``node.json`` whose TLS-relevant or quota-relevant
+    field is one character off would configure a node the operator does not
+    believe they configured. The message names the unknown fields and the
+    accepted set, never a value: a key can be wrong without its content being
+    a secret, and quoting values is a habit this package keeps out of its
+    refusals.
+
+    Args:
+        document: The parsed configuration document.
+        allowed: The keys this document may carry.
+        context: The file description the error message is prefixed with.
+
+    Raises:
+        DeploymentError: Naming every unknown field and the accepted set.
+    """
+    unknown = sorted(key for key in document if key not in allowed)
+    if unknown:
+        raise DeploymentError(
+            f"{context}: unknown field(s) {', '.join(repr(key) for key in unknown)}; "
+            f"this file accepts only {', '.join(sorted(allowed))}"
+        )
+
+
 def _field(document: dict[str, Any], key: str, context: str) -> Any:
     """Return a required field's raw value.
 
@@ -507,7 +580,8 @@ def _load_adapter(document: dict[str, Any], context: str) -> Adapter:
     """Build the one fixed upstream adapter a node configures.
 
     Raises:
-        DeploymentError: If the adapter block is malformed, an ``http`` adapter
+        DeploymentError: If the adapter block is malformed, carries a key
+            outside ``ADAPTER_CONFIG_KEYS``, an ``http`` adapter
             has a missing or non-absolute endpoint, an ``http`` adapter has no
             api_key, or a ``fake`` adapter was handed an api_key. A fake
             upstream has no credential, so silently accepting one would let an
@@ -517,6 +591,7 @@ def _load_adapter(document: dict[str, Any], context: str) -> Adapter:
     if not isinstance(document.get("adapter"), dict):
         raise DeploymentError(f"{adapter_context} must be a JSON object")
     adapter = cast("dict[str, Any]", document["adapter"])
+    reject_unknown_keys(adapter, ADAPTER_CONFIG_KEYS, adapter_context)
     kind = require_str(adapter, "kind", adapter_context)
     if kind not in _ADAPTER_KINDS:
         raise DeploymentError(
@@ -595,13 +670,14 @@ def load_node(path: str | Path) -> tuple[ConnectorConfig, Adapter]:
 
     Raises:
         DeploymentError: On any malformed field, a non-``ws(s)://`` server
-            URL, a key listed in ``RENAMED_CONFIG_KEYS``, or a refused adapter
-            block.
+            URL, a key listed in ``RENAMED_CONFIG_KEYS``, a key outside
+            ``NODE_CONFIG_KEYS``, or a refused adapter block.
     """
     config_path = Path(path)
     context = f"node configuration {config_path}"
     document = load_document(config_path)
     reject_renamed_keys(document, context)
+    reject_unknown_keys(document, NODE_CONFIG_KEYS, context)
     server_url = require_str(document, "server_url", context)
     absolute_url(server_url, what="'server_url'", schemes=("ws", "wss"), context=context)
     node_id = require_str(document, "node_id", context)
@@ -676,13 +752,15 @@ def load_consumer(path: str | Path) -> dict[str, str]:
 
     Raises:
         DeploymentError: If the file is malformed, carries a key listed in
-            ``RENAMED_CONFIG_KEYS``, or the URL is not an absolute
+            ``RENAMED_CONFIG_KEYS``, carries a key outside
+            ``CONSUMER_CONFIG_KEYS``, or the URL is not an absolute
             ``http(s)://`` URL.
     """
     config_path = Path(path)
     context = f"consumer configuration {config_path}"
     document = load_document(config_path)
     reject_renamed_keys(document, context)
+    reject_unknown_keys(document, CONSUMER_CONFIG_KEYS, context)
     server_url = require_str(document, "server_url", context)
     absolute_url(server_url, what="'server_url'", schemes=("http", "https"), context=context)
     token = require_str(document, "token", context)

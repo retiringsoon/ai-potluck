@@ -88,7 +88,7 @@ Variants:
 ./install.sh --prefix ~/tools/potluck
 ./install.sh --preflight          # run the compatibility checks and stop
 ./install.sh --uninstall          # removes venv + launcher, keeps config/keys
-./install.sh --source "ai-potluck @ git+https://HOST/REPO@v0.1.0"
+./install.sh --source "ai-potluck @ git+https://HOST/REPO@v0.3.0"
 ```
 
 An upgrade reruns the same command: the virtualenv is rebuilt from scratch (it

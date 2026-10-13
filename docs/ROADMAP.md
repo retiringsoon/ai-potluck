@@ -2,7 +2,7 @@
 
 > Living document. Priorities below "Shipped" move in response to early-user feedback
 > ([PROPOSAL.md](PROPOSAL.md#what-were-asking-early-users)) — that's deliberate.
-> Status as of **v0.1.0**.
+> Status as of **v0.3.0-dev**.
 
 ## ✅ Shipped — v0.1.0
 

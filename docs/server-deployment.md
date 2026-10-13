@@ -343,6 +343,19 @@ curl -s http://127.0.0.1:8801/v1/checkpoint -H "Authorization: Bearer <consumer 
 
 - 健康检查：`GET /healthz`（无需鉴权）返回 `{"status":"ok"}`。systemd/launchd 之外，再加一个外部探针（`curl -fsS` + 告警）。
 - 运维视图：`GET /v1/nodes`（消费者角色凭据：consumer token 或 `AIPotluck-Sig` 签名）给出在线节点与能力；`GET /v1/checkpoint` 给出最新签名检查点（可用作"账本还在长"的指标）。
+- **管理页（运营者仪表盘，可选）**：给 `serve` 加 `--admin-ui <端口>`，同一进程、同一个库上多起一个只读监听，浏览器打开就是一张深色单页：consumer/node 排名、队列深度与在跑请求、今日与近 7 天的 requests/tokens/milli-credit、tokens/小时、会话聚合、最近收据，每 10s 自动刷新。
+
+  ```sh
+  # 中心服务器上（长期开启就写进 §5 unit 的 ExecStart）
+  ~/.aipotluck/venv/bin/potluck-server serve --config ~/server/server.json --admin-ui 9802
+
+  # 自己的电脑上开隧道，然后浏览器打开 http://127.0.0.1:9802/
+  ssh -L 9802:127.0.0.1:9802 <你的服务器>
+  ```
+
+  安全口径：**它不鉴权**，所以只绑 IPv4 回环字面量（`127.0.0.0/8`）；给任何别的地址（`0.0.0.0`、`::`、`::1`、主机名、内网 IP）都拒绝启动，报 `NonLoopbackAdminBindError`。页面只读：库以 `mode=ro` 打开，写操作被 SQLite 自己拒掉，也没有任何能改状态的接口（邀请、吊销、对账仍然走 `admin` 子命令）。单页 HTML/CSS/JS 全内联，不取 CDN、不加载框架与图片，并带 `Content-Security-Policy: default-src 'none'; connect-src 'self'`，因此**不要**把这个端口挂到 §4B 的反代后面，也不要用 SSH 的 `GatewayPorts` 转发出去——那等于把全平台的账目公开到公网。跨机访问只用上面的隧道（用你已有的 SSH key 认证）。
+
+  端点清单（`/admin/api/overview.json`、`consumers.json`、`nodes.json`、`sessions.json`、`receipts.json`，均支持 `?limit=`）、每个数字的确切口径（窗口按"请求被接收的时刻"归组、tokens 与 milli-credit 为何是两个数、结算修正只按最新一张收据计一次）见 `ai-potluck-server/docs/admin-ui.md`。
 - **不要裸暴露到公网。** 服务端是手写的 HTTP/WebSocket/SSE 栈，**没有任何速率限制或 DoS 防护**：`POST /v1/join`、`POST /v1/requests` 都接受无上限的请求速率（邀请码本身 192 bit，爆破不可行，但恶意刷请求会烧 CPU）。公网部署必须二选一：
   1. 前面套反代，终结 TLS 并在反代上限流（§4B）；或
   2. 只在 Tailscale 之类的私有网络里可达（§4C）。
