@@ -132,6 +132,7 @@ from .deploy import (
     load_node,
     poll_request_until_terminal,
     redacted_node,
+    reject_renamed_keys,
 )
 from .errors import CanonicalizationError, PotluckError, UnknownKeyError
 from .identity import generate_key_pair, load_private_key
@@ -1705,7 +1706,8 @@ def load_joined_identity(directory: Path) -> tuple[dict[str, Any], dict[str, Any
     """Load the saved identity's config and key documents.
 
     Raises:
-        PotluckError: If either file is absent or malformed.
+        PotluckError: If either file is absent or malformed, or the config
+            carries a key listed in ``RENAMED_CONFIG_KEYS``.
     """
     config_path = directory / _CONFIG_FILE
     key_path = directory / _KEY_FILE
@@ -1718,6 +1720,7 @@ def load_joined_identity(directory: Path) -> tuple[dict[str, Any], dict[str, Any
     config_document = canonical.loads_strict(raw)
     if not isinstance(config_document, dict):
         raise PotluckError(f"identity config {config_path} must be a JSON object")
+    reject_renamed_keys(config_document, f"identity config {config_path}")
     for field in ("server_url", "key_id", "subject_id", "tenant_id", "role"):
         value = config_document.get(field)
         if not isinstance(value, str) or not value:

@@ -37,6 +37,11 @@ MODEL = "coding-pool"
 CONSUMER_TOKEN = "consumer-token-cli"
 REQUEST_ID = "R-cli-1"
 
+#: The URL key a pre-rename identity config carried. Spelled literally so the
+#: test pins the key a real stale ``config.json`` holds; see the client
+#: package's `RENAMED_CONFIG_KEYS`.
+STALE_URL_KEY = "center_url"
+
 
 def _keygen(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> tuple[Path, str]:
     """Run ``keygen`` and return the private key path and the printed public key."""
@@ -251,6 +256,48 @@ def test_request_without_auth_file_fails_with_actionable_message(
     assert "--auth-file" in message
     assert "potluck sign" in message
     assert "consumer key" in message
+
+
+def test_ask_refuses_an_identity_config_still_naming_the_old_url_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An identity saved before the rename is told which key to write now.
+
+    The refusal happens before any network traffic, and it names both the key
+    the file has and the key that replaced it: a bare "required field missing"
+    would send the operator looking for something absent rather than something
+    stale.
+    """
+    directory = tmp_path / "aipotluck"
+    directory.mkdir()
+    public_key_b64, private_key_b64 = generate_key_pair()
+    (directory / "config.json").write_text(
+        json.dumps(
+            {
+                STALE_URL_KEY: "http://127.0.0.1:1",
+                "key_id": "consumer-key-1",
+                "subject_id": "consumer-X",
+                "tenant_id": "tenant-1",
+                "role": "consumer",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (directory / "key.json").write_text(
+        json.dumps({"public_key_b64": public_key_b64, "private_key_b64": private_key_b64}),
+        encoding="utf-8",
+    )
+
+    code = main(["ask", "--config-dir", str(directory), "hello"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert captured.out == ""
+    assert STALE_URL_KEY in captured.err
+    assert "renamed to 'server_url'" in captured.err
+    assert private_key_b64 not in captured.err
+
+
 
 
 def _public_key(public_key_b64: str) -> Ed25519PublicKey:

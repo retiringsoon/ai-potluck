@@ -30,6 +30,11 @@ CONSUMER_TOKEN = "consumer-token-deploy-secret"
 NODE_TOKEN = "node-token-deploy-secret"
 API_KEY = "sk-upstream-key-deploy-secret"
 
+#: The URL key a pre-rename config carried. Spelled literally here rather than
+#: read from `RENAMED_CONFIG_KEYS`, so the test pins the key a real stale file
+#: holds: a guard whose mapping drifted would otherwise still pass.
+STALE_URL_KEY = "center_url"
+
 
 def _write_json(path: Path, document: dict[str, Any]) -> Path:
     """Write a strict-JSON configuration file."""
@@ -142,3 +147,36 @@ def test_load_consumer_round_trips_and_refuses_non_http(tmp_path: Path) -> None:
         load_consumer(path)
     assert "https://" in str(excinfo.value)
     assert CONSUMER_TOKEN not in str(excinfo.value)
+
+
+def test_a_config_still_naming_the_old_url_key_is_refused_and_points_at_the_new_one(
+    tmp_path: Path,
+) -> None:
+    """Both loaders refuse a pre-rename file and name the replacement key.
+
+    The rename is forward-only, so there is no path that reads either spelling
+    and guesses. What an operator with an older ``consumer.json`` or
+    ``node.json`` gets is the key they wrote and the key to write instead —
+    never a report that ``server_url`` is simply absent from a file that looks
+    complete to them, and never a message quoting a secret.
+    """
+    stale_consumer = _write_json(
+        tmp_path / "consumer.json",
+        {STALE_URL_KEY: "https://server.example.com", "token": CONSUMER_TOKEN},
+    )
+    with pytest.raises(DeploymentError) as excinfo:
+        load_consumer(stale_consumer)
+    message = str(excinfo.value)
+    assert STALE_URL_KEY in message
+    assert "renamed to 'server_url'" in message
+    assert CONSUMER_TOKEN not in message
+
+    stale_node = _node_document(tmp_path)
+    stale_node[STALE_URL_KEY] = stale_node.pop("server_url")
+    with pytest.raises(DeploymentError) as excinfo:
+        load_node(_write_json(tmp_path / "node.json", stale_node))
+    message = str(excinfo.value)
+    assert STALE_URL_KEY in message
+    assert "renamed to 'server_url'" in message
+    assert NODE_TOKEN not in message
+    assert API_KEY not in message

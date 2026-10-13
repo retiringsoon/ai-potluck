@@ -51,10 +51,10 @@ import secrets
 import socket
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit
 
 from aipotluck.proxy import http_connection_for
@@ -330,6 +330,31 @@ def load_document(path: Path) -> dict[str, Any]:
     return cast("dict[str, Any]", parsed)
 
 
+#: Configuration keys a pre-rename file may still carry, each mapped to the key
+#: that replaced it. The rename is forward-only, so no loader reads both
+#: spellings: a stale file is refused with the replacement named, rather than
+#: reported as a missing field the operator has no way to act on.
+RENAMED_CONFIG_KEYS: Final = {"center_url": "server_url"}
+
+
+def reject_renamed_keys(document: Mapping[str, Any], context: str) -> None:
+    """Refuse a configuration document that still carries a renamed key.
+
+    Args:
+        document: The parsed configuration document.
+        context: The file description the error message is prefixed with.
+
+    Raises:
+        DeploymentError: Naming the stale key and the key that replaced it.
+    """
+    for old_key, new_key in RENAMED_CONFIG_KEYS.items():
+        if old_key in document:
+            raise DeploymentError(
+                f"{context}: field {old_key!r} was renamed to {new_key!r}; "
+                f"update your config to use {new_key!r}"
+            )
+
+
 def _field(document: dict[str, Any], key: str, context: str) -> Any:
     """Return a required field's raw value.
 
@@ -570,11 +595,13 @@ def load_node(path: str | Path) -> tuple[ConnectorConfig, Adapter]:
 
     Raises:
         DeploymentError: On any malformed field, a non-``ws(s)://`` server
-            URL, or a refused adapter block.
+            URL, a key listed in ``RENAMED_CONFIG_KEYS``, or a refused adapter
+            block.
     """
     config_path = Path(path)
     context = f"node configuration {config_path}"
     document = load_document(config_path)
+    reject_renamed_keys(document, context)
     server_url = require_str(document, "server_url", context)
     absolute_url(server_url, what="'server_url'", schemes=("ws", "wss"), context=context)
     node_id = require_str(document, "node_id", context)
@@ -648,12 +675,14 @@ def load_consumer(path: str | Path) -> dict[str, str]:
         they raise.
 
     Raises:
-        DeploymentError: If the file is malformed or the URL is not an
-            absolute ``http(s)://`` URL.
+        DeploymentError: If the file is malformed, carries a key listed in
+            ``RENAMED_CONFIG_KEYS``, or the URL is not an absolute
+            ``http(s)://`` URL.
     """
     config_path = Path(path)
     context = f"consumer configuration {config_path}"
     document = load_document(config_path)
+    reject_renamed_keys(document, context)
     server_url = require_str(document, "server_url", context)
     absolute_url(server_url, what="'server_url'", schemes=("http", "https"), context=context)
     token = require_str(document, "token", context)
