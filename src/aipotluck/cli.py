@@ -151,7 +151,7 @@ from .reconcile import (
     verify_receipt_from_server,
 )
 from .records import SpendAuthorization, new_nonce
-from .statemachine import TERMINAL_REQUEST_STATES
+from .statemachine import PRE_DISPATCH_REQUEST_STATES, TERMINAL_REQUEST_STATES
 from .wire import ChatMessage, check_session_id, compute_request_digest, user_message
 
 PROG = "potluck"
@@ -1945,16 +1945,21 @@ def _model_nodes(client: SignedClient, model: str) -> list[dict[str, Any]]:
     Reads the authenticated ``GET /v1/nodes`` view. The filter is local because
     the endpoint lists every connected node; the client only cares about nodes
     that could actually take this request.
+
+    Raises:
+        PotluckError: If the listing cannot be read, or the server answered
+            with something other than a ``nodes`` array. An unreadable listing
+            says nothing about whether a node exists, so it is never flattened
+            into "there are none": the callers treat an empty answer as "no
+            node can run this" and end the request over it, which is only ever
+            true of a listing that was actually read.
     """
-    try:
-        document = client.get("/v1/nodes")
-    except PotluckError:
-        # A node listing that cannot be read says nothing about whether a node
-        # exists, so it must not be read as "there are none".
-        return []
+    document = client.get("/v1/nodes")
     nodes = document.get("nodes")
     if not isinstance(nodes, list):
-        return []
+        raise PotluckError(
+            "server returned a malformed node listing: 'nodes' is not an array"
+        )
     return [
         node
         for node in nodes
@@ -2023,7 +2028,10 @@ def _await_terminal(
     deadline, so waiting out `timeout_s` would mean a user staring at a
     two-minute silence for a request that provably cannot start. The node list
     is consulted each poll, and the grace only starts once the list is empty,
-    so a node that appears late still gets its chance.
+    so a node that appears late still gets its chance. The list is only ever
+    consulted while the request is pre-dispatch — see
+    `PRE_DISPATCH_REQUEST_STATES` — because a request a node is already
+    executing is billed work no listing may end.
 
     Args:
         client: The signed consumer.
@@ -2052,7 +2060,14 @@ def _await_terminal(
         ):
             return document
         now = time.monotonic()
-        if _model_nodes(client, model):
+        if document.get("status") not in PRE_DISPATCH_REQUEST_STATES:
+            # A node already holds an attempt: it is demonstrably serving this
+            # request, so the listing is not even consulted. A request past the
+            # pre-dispatch states is billed work, and a node that pauses
+            # mid-flight must never be mistaken for a node that was never
+            # there — ending the request here would cancel a real charge.
+            empty_since = None
+        elif _model_nodes(client, model):
             empty_since = None
         elif empty_since is None:
             empty_since = now
@@ -2517,7 +2532,7 @@ def run_streaming_answer(
                     # once an attempt exists, a node is demonstrably serving it,
                     # and a node that pauses mid-flight must not be mistaken for
                     # a node that was never there.
-                    if status in {"CREATED", "RESERVED", "ROUTING"}:
+                    if status in PRE_DISPATCH_REQUEST_STATES:
                         if _model_nodes(client, model):
                             empty_since = None
                         elif empty_since is None:

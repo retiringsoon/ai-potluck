@@ -25,7 +25,14 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from aipotluck.canonical import base64_decode, verify_payload
-from aipotluck.cli import build_signed_request, load_joined_identity, main
+from aipotluck.cli import (
+    NoAvailableNodes,
+    _await_terminal,
+    _model_nodes,
+    build_signed_request,
+    load_joined_identity,
+    main,
+)
 from aipotluck.errors import PotluckError, ProtocolError
 from aipotluck.identity import generate_key_pair
 from aipotluck.records import DOMAIN_AUTHORIZATION
@@ -484,3 +491,116 @@ def test_an_unknown_identity_config_field_is_refused(tmp_path: Path) -> None:
     message = str(excinfo.value)
     assert "'server'" in message
     assert "server_url" in message, "the accepted set is named"
+
+
+# --------------------------------------------------------------------------- #
+# The node check during a wait
+# --------------------------------------------------------------------------- #
+
+
+class _StubClient:
+    """A stand-in signed client whose reads come from a per-path script.
+
+    `_await_terminal` polls two paths over and over, and a read that finds its
+    queue empty fails the way an unreachable server would — the case the node
+    check must never mistake for "there are no nodes".
+    """
+
+    def __init__(self, answers: dict[str, list[dict[str, Any]]]) -> None:
+        self._answers = {path: list(items) for path, items in answers.items()}
+        self.reads: list[str] = []
+
+    def get(self, path: str) -> dict[str, Any]:
+        self.reads.append(path)
+        queue = self._answers.get(path)
+        if not queue:
+            raise PotluckError(f"stub client cannot read {path}")
+        return queue.pop(0)
+
+
+def test_an_unreadable_node_listing_is_never_read_as_no_nodes() -> None:
+    """A listing that cannot be read propagates instead of flattening to none.
+
+    The callers treat an empty listing as "no node can run this" and end the
+    request over it — a request that may already be running and billing. An
+    unreadable listing says nothing about whether a node exists, so it must
+    raise and let the caller surface the real cause.
+    """
+    client = _StubClient({})
+
+    with pytest.raises(PotluckError):
+        _model_nodes(client, MODEL)
+
+
+def test_a_malformed_node_listing_is_refused() -> None:
+    """A `nodes` field that is not an array is a server contract violation."""
+    client = _StubClient({"/v1/nodes": [{"nodes": "node-1"}]})
+
+    with pytest.raises(PotluckError) as excinfo:
+        _model_nodes(client, MODEL)
+
+    assert "nodes" in str(excinfo.value)
+
+
+def test_the_node_listing_is_filtered_to_sharing_nodes_of_the_model() -> None:
+    """Only online, sharing nodes advertising the model can take the request."""
+    wanted = {"model": MODEL, "share_enabled": True}
+    client = _StubClient(
+        {
+            "/v1/nodes": [
+                {
+                    "nodes": [
+                        wanted,
+                        {"model": MODEL, "share_enabled": False},
+                        {"model": "other", "share_enabled": True},
+                        "not-a-node",
+                    ]
+                }
+            ]
+        }
+    )
+
+    assert _model_nodes(client, MODEL) == [wanted]
+
+
+def test_a_running_request_is_never_ended_over_the_node_listing() -> None:
+    """A node that pauses mid-flight is not a node that was never there.
+
+    The request is RUNNING: a node demonstrably holds the attempt, so the work
+    is billed whatever the listing says, and ending it here would cancel a real
+    charge. The grace that ends an undispatchable request must not run.
+    """
+    client = _StubClient(
+        {
+            "/v1/requests/R-1": [
+                {"status": "RUNNING"},
+                {"status": "RUNNING"},
+                {"status": "SUCCEEDED", "settlement": {"receipt_id": "R-1"}},
+            ],
+            "/v1/nodes": [{"nodes": []}, {"nodes": []}],
+        }
+    )
+
+    document = _await_terminal(
+        client, "R-1", model=MODEL, timeout_s=5.0, no_node_grace_s=0.05
+    )
+
+    assert document["status"] == "SUCCEEDED"
+
+
+def test_a_routing_request_with_no_node_for_the_whole_grace_is_refused() -> None:
+    """The positive half: a pre-dispatch request nothing can take ends early.
+
+    Waiting out the full timeout would be a user staring at silence for a
+    request that provably cannot start, so the empty listing ends it — with the
+    refusal that says so, not a timeout that hides the cause.
+    """
+    client = _StubClient(
+        {
+            "/v1/requests/R-1": [{"status": "ROUTING"}, {"status": "ROUTING"}],
+            "/v1/nodes": [{"nodes": []}, {"nodes": []}],
+        }
+    )
+
+    with pytest.raises(NoAvailableNodes):
+        _await_terminal(client, "R-1", model=MODEL, timeout_s=5.0, no_node_grace_s=0.05)
