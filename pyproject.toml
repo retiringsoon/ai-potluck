@@ -1,6 +1,6 @@
 [project]
 name = "ai-potluck"
-version = "0.1.0"
+version = "0.3.0"
 description = "AI potluck client and protocol core: verifiable metering and multi-party settlement for shared compute"
 readme = "README.md"
 license = "MIT"

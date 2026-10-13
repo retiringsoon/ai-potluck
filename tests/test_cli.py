@@ -25,8 +25,8 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from aipotluck.canonical import base64_decode, verify_payload
-from aipotluck.cli import build_signed_request, main
-from aipotluck.errors import ProtocolError
+from aipotluck.cli import build_signed_request, load_joined_identity, main
+from aipotluck.errors import PotluckError, ProtocolError
 from aipotluck.identity import generate_key_pair
 from aipotluck.records import DOMAIN_AUTHORIZATION
 from aipotluck.wire import ChatMessage, compute_request_digest, encode_chat_parameters
@@ -464,3 +464,23 @@ def test_a_session_identifier_the_wire_refuses_is_refused_before_signing() -> No
             delivery_mode="buffered_complete",
             session_id="two words",
         )
+
+
+def test_an_unknown_identity_config_field_is_refused(tmp_path: Path) -> None:
+    """The saved identity config has an accepted set like every other config.
+
+    A field a future version no longer reads — or one an editor added by
+    hand — is named when the identity loads, rather than silently ignored
+    while commands authenticate with a subset of what the file claims.
+    """
+    config_document, key_document, _ = _identity_documents()
+    config_document["server"] = config_document.pop("server_url")
+    directory = tmp_path / ".aipotluck"
+    directory.mkdir()
+    (directory / "config.json").write_text(json.dumps(config_document), encoding="utf-8")
+    (directory / "key.json").write_text(json.dumps(key_document), encoding="utf-8")
+    with pytest.raises(PotluckError) as excinfo:
+        load_joined_identity(directory)
+    message = str(excinfo.value)
+    assert "'server'" in message
+    assert "server_url" in message, "the accepted set is named"

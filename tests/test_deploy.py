@@ -180,3 +180,52 @@ def test_a_config_still_naming_the_old_url_key_is_refused_and_points_at_the_new_
     assert "renamed to 'server_url'" in message
     assert NODE_TOKEN not in message
     assert API_KEY not in message
+
+
+def test_an_unknown_node_field_is_refused_with_the_accepted_set_named(
+    tmp_path: Path,
+) -> None:
+    """A misspelled key is refused, never read as an absent one.
+
+    ``max_concurrency`` one character off would otherwise load with the
+    default and run a node configured differently from the file the operator
+    wrote. The refusal names the unknown field and the accepted set, and
+    quotes no value.
+    """
+    document = _node_document(tmp_path)
+    document["max_concurancy"] = document.pop("max_concurrency")
+    with pytest.raises(DeploymentError) as excinfo:
+        load_node(_write_json(tmp_path / "node.json", document))
+    message = str(excinfo.value)
+    assert "max_concurancy" in message
+    assert "max_concurrency" in message, "the accepted set is named"
+    assert NODE_TOKEN not in message
+    assert API_KEY not in message
+
+
+def test_an_unknown_adapter_field_is_refused(tmp_path: Path) -> None:
+    """The adapter block has its own accepted set.
+
+    A ``timeout_s`` the loader ignores would leave the operator believing a
+    per-request timeout is configured when no adapter ever reads one.
+    """
+    document = _node_document(tmp_path)
+    document["adapter"]["timeout_s"] = 30
+    with pytest.raises(DeploymentError) as excinfo:
+        load_node(_write_json(tmp_path / "node.json", document))
+    message = str(excinfo.value)
+    assert "timeout_s" in message
+    assert API_KEY not in message
+
+
+def test_an_unknown_consumer_field_is_refused(tmp_path: Path) -> None:
+    document = {
+        "server_url": "https://server.example.com",
+        "token": CONSUMER_TOKEN,
+        "url": "https://elsewhere.example.com",
+    }
+    with pytest.raises(DeploymentError) as excinfo:
+        load_consumer(_write_json(tmp_path / "consumer.json", document))
+    message = str(excinfo.value)
+    assert "'url'" in message
+    assert CONSUMER_TOKEN not in message

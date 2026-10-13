@@ -76,7 +76,7 @@ git clone <repo-url> && cd ai-potluck
 ./install.sh --prefix ~/tools/potluck
 ./install.sh --preflight          # 只跑兼容性检查，不安装
 ./install.sh --uninstall          # 删除 venv 与启动器，保留 config/keys
-./install.sh --source "ai-potluck @ git+https://HOST/REPO@v0.1.0"
+./install.sh --source "ai-potluck @ git+https://HOST/REPO@v0.3.0"
 ```
 
 升级就是再跑一次同一条命令：虚拟环境整体重建（里面没有用户数据），而
