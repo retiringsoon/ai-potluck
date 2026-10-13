@@ -370,17 +370,35 @@ class NodeStore(_Store):
     def finish_execution(self, attempt_id: str, state: str, *, at: dt.datetime) -> None:
         """Mark an execution finished with a terminal state.
 
+        The verdict is written once. A row that already carries a terminal state
+        is never overwritten: a CANCEL that marked the attempt FAILED while the
+        worker was mid-stream must survive the worker's own completion, or the
+        node would report SUBMITTED for an attempt the server cancelled. The
+        race is real — the cancel runs on the socket loop and the completion on
+        the worker — so the guarantee lives in the WHERE clause rather than in
+        every caller remembering to check first.
+
         Raises:
-            StateTransitionError: If no such execution exists.
+            StateTransitionError: If no such execution exists, or it already
+                finished, naming the state it finished with.
         """
         conn = self._connection()
         with self._immediate(conn):
             cur = conn.execute(
-                "UPDATE executions SET state = ?, finished_at = ? WHERE attempt_id = ?",
+                "UPDATE executions SET state = ?, finished_at = ?"
+                " WHERE attempt_id = ? AND finished_at IS NULL",
                 (state, _to_text(at), attempt_id),
             )
             if cur.rowcount == 0:
-                raise StateTransitionError(f"unknown execution {attempt_id}")
+                row = conn.execute(
+                    "SELECT state FROM executions WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
+                if row is None:
+                    raise StateTransitionError(f"unknown execution {attempt_id}")
+                raise StateTransitionError(
+                    f"execution {attempt_id} already finished as {row['state']};"
+                    f" refusing to overwrite it with {state}"
+                )
 
     def record_upstream_call(self, attempt_id: str) -> int:
         """Increment and return an execution's upstream-call count.

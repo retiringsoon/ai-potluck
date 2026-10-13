@@ -236,6 +236,7 @@ def make_offer(
     authorization_hash: str = "auth-1",
     messages: tuple[ChatMessage, ...] = (user_message("hi"),),
     parameters: dict[str, object] | None = None,
+    delivery_mode: str = "buffered_complete",
 ) -> AttemptOffer:
     """Build an offer whose `permit_hash` matches its own fields."""
     permit_hash = compute_permit_hash(
@@ -256,7 +257,7 @@ def make_offer(
         request_digest=request_digest,
         max_milli_credits=max_milli_credits,
         deadline_ms=1000,
-        delivery_mode="buffered_complete",
+        delivery_mode=delivery_mode,
         messages=messages,
         parameters=dict(parameters or {}),
         authorization_hash=authorization_hash,
@@ -588,6 +589,31 @@ def test_offer_with_mismatched_permit_is_rejected(tmp_path) -> None:
     assert adapter.upstream_calls == 0
 
 
+def test_an_offer_for_a_model_this_node_never_advertised_is_refused(tmp_path) -> None:
+    """A node runs the one model it advertised, whatever the permit says.
+
+    The permit below is well-formed — `make_offer` signs terms for the model it
+    names — and that is the point: a center offering work for a model this
+    node's hello never claimed is misconfigured at best. Accepting it would
+    bill a consumer for an answer from an upstream they did not choose, paid
+    with a credential that cannot even run it.
+    """
+    adapter = FakeUpstreamAdapter()
+    config = make_config(tmp_path, "ws://127.0.0.1:1/v1/node-link", adapter)
+    connector = Connector(config, adapter=adapter)
+    offer = make_offer(model="a-model-this-node-does-not-serve")
+
+    outgoing = connector.handle_message(Envelope("attempt.offer", offer.to_payload()))
+
+    assert [envelope.type for envelope in outgoing] == ["attempt.reject"]
+    reason = str(outgoing[0].payload["reason"])
+    assert "a-model-this-node-does-not-serve" in reason
+    assert adapter.model in reason, "the refusal names the model this node serves"
+    assert connector.store.get_execution("A1") is None
+    assert connector.upstream_call_count == 0
+    assert adapter.upstream_calls == 0
+
+
 # --------------------------------------------------------------------------- #
 # 5. Local policy refusal
 # --------------------------------------------------------------------------- #
@@ -613,8 +639,10 @@ def test_offer_refused_when_concurrency_is_full(tmp_path) -> None:
     adapter = GatedAdapter()
     config = make_config(tmp_path, "ws://127.0.0.1:1/v1/node-link", adapter, max_concurrency=1)
     connector = Connector(config, adapter=adapter)
-    first = make_offer(attempt_id="A1", request_id="R1")
-    second = make_offer(attempt_id="A2", request_id="R2")
+    # The offers name the gated adapter's own model: a node refuses work for a
+    # model it never advertised, and this test is about the slot limit.
+    first = make_offer(attempt_id="A1", request_id="R1", model="gated-model")
+    second = make_offer(attempt_id="A2", request_id="R2", model="gated-model")
 
     accepted = connector.handle_message(Envelope("attempt.offer", first.to_payload()))
     assert [envelope.type for envelope in accepted] == ["attempt.accept"]
@@ -833,3 +861,132 @@ def execution_finished(connector: Connector, attempt_id: str) -> bool:
     """Whether the node has finished the named execution."""
     record = connector.store.get_execution(attempt_id)
     return record is not None and record.finished_at is not None
+
+
+# --------------------------------------------------------------------------- #
+# 11. CANCEL
+# --------------------------------------------------------------------------- #
+
+
+def test_a_cancel_before_execute_never_reaches_the_upstream(server, tmp_path) -> None:
+    """A CANCEL for an accepted offer survives the spool drain.
+
+    The drain retires per-attempt memory once an attempt's spool is empty, and
+    an accepted-but-never-executed offer has an empty spool. Retiring its cancel
+    event there — as this once did — let the EXECUTE that followed really call
+    the upstream for an attempt the server had cancelled: the operator's quota
+    spent on work nobody wants. The cancel now writes a durable FAILED row, so
+    the attempt is dead for good and a late EXECUTE, drain or no drain, answers
+    from the row instead of calling the upstream.
+    """
+    adapter = FakeUpstreamAdapter()
+    adapter.upstream.queue(
+        FakeResponse(
+            text_chunks=("must never stream",),
+            usage=NormalizedUsage(input_total=1, output_total=1),
+        )
+    )
+    offer = make_offer(messages=(user_message("hi"),))
+    states: list[dict[str, object]] = []
+
+    def script(index: int, link: Link) -> None:
+        del index
+        link.recv()
+        link.send(hello_ack())
+        link.send(Envelope("attempt.offer", offer.to_payload()))
+        link.recv_until("attempt.accept")
+        link.send(
+            Envelope(
+                "attempt.cancel",
+                AttemptRef(offer.request_id, offer.attempt_id, offer.epoch).to_payload(),
+            )
+        )
+        # Let the session loop drain the (empty) spool at least once: this is
+        # where the cancel event used to be forgotten.
+        time.sleep(0.3)
+        for _ in range(2):
+            link.send(execute(offer))
+            state = link.recv_until("attempt.state")
+            states.append(state.payload)
+
+    instance = server(script)
+    config = make_config(tmp_path, instance.url, adapter)
+    connector = Connector(config, adapter=adapter)
+    connector.run_once()
+
+    instance.raise_errors()
+    # The load-bearing assertions: no upstream call happened, not even once the
+    # drain had retired the attempt's in-memory state, and the durable row says
+    # so. The second EXECUTE proves the retired offer is answered from the row
+    # rather than degrading into "unknown attempt".
+    assert adapter.upstream_calls == 0
+    assert connector.upstream_call_count == 0
+    assert len(states) == 2
+    for payload in states:
+        assert payload["state"] == "FAILED"
+        assert payload["certainty"] == "not_submitted"
+        assert payload["upstream_calls"] == 0
+    execution = connector.store.get_execution(offer.attempt_id)
+    assert execution is not None
+    assert execution.state == "FAILED"
+    assert execution.upstream_calls == 0
+
+
+def test_a_cancel_mid_stream_records_the_call_and_reports_nothing(server, tmp_path) -> None:
+    """A CANCEL mid-stream stops the report but never the count.
+
+    The first increment proves the upstream really served the call, so the
+    execution row keeps `upstream_calls` at 1 even though the attempt ends
+    cancelled: recording it as never made would understate the operator's cost
+    exactly as a double count would overstate it. Nothing terminal is spooled —
+    no usage report and no completion — because billing a consumer for a
+    request they cancelled is the one charge this network must never make.
+    """
+    adapter = FakeUpstreamAdapter()
+    adapter.upstream.stream_delay_s = 0.05
+    adapter.upstream.stream_blocks = 6
+    adapter.upstream.queue(
+        FakeResponse(
+            text_chunks=("abcdef",),
+            usage=NormalizedUsage(input_total=6, output_total=6),
+        )
+    )
+    offer = make_offer(messages=(user_message("hi"),), delivery_mode="stream_strict")
+
+    def script(index: int, link: Link) -> None:
+        del index
+        link.recv()
+        link.send(hello_ack())
+        link.send(Envelope("attempt.offer", offer.to_payload()))
+        link.recv_until("attempt.accept")
+        link.send(execute(offer))
+        # The first increment is on the wire, so the upstream call is a fact.
+        link.recv_until("attempt.event")
+        link.send(
+            Envelope(
+                "attempt.cancel",
+                AttemptRef(offer.request_id, offer.attempt_id, offer.epoch).to_payload(),
+            )
+        )
+        time.sleep(0.5)
+
+    instance = server(script)
+    config = make_config(tmp_path, instance.url, adapter)
+    connector = Connector(config, adapter=adapter)
+    connector.run_once()
+
+    instance.raise_errors()
+    execution = connector.store.get_execution(offer.attempt_id)
+    assert execution is not None
+    assert execution.state == "FAILED"
+    assert execution.upstream_calls == 1
+    assert connector.upstream_call_count == 1
+    assert adapter.upstream_calls == 1
+    terminal = [
+        envelope
+        for envelope in instance.links[0].seen
+        if envelope.type == "attempt.event"
+        and envelope.payload["event_type"]
+        in ("usage.final", "attempt.completed", "attempt.failed")
+    ]
+    assert terminal == []

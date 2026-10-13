@@ -273,11 +273,14 @@ class Connector:
 
     @property
     def upstream_call_count(self) -> int:
-        """Return successful upstream calls made by this connector's adapter.
+        """Return the upstream calls this connector's adapter dispatched.
 
-        Counted only for completions the adapter actually returned, so a link
-        drop or a policy refusal cannot be mistaken for a call, and a refused or
-        duplicate attempt provably adds nothing here.
+        A call counts once its request bytes are on the wire — a completion the
+        adapter returned, a stream's first increment, or an answer lost after
+        the request was sent — so a link drop or a policy refusal cannot be
+        mistaken for a call, a refused or duplicate attempt provably adds
+        nothing here, and a cancel that stops a stream mid-way still counts the
+        call the operator's upstream really served.
         """
         with self._state.lock:
             return self._upstream_calls
@@ -548,6 +551,27 @@ class Connector:
                 "refusing offer for attempt %s: permit hash mismatch", offer.attempt_id
             )
             return [self._reject(reference, "offer terms do not match the signed permit")]
+        if offer.model != self._config.model:
+            # One node serves the one model it advertised in its hello. An offer
+            # for any other model is work this node's endpoint and credential
+            # cannot run: accepting it would bill a consumer for an answer from
+            # an upstream they never chose, and the permit being well-formed
+            # says only that the platform signed it, not that this node claimed
+            # it. A center that offers past the advertisement is misconfigured
+            # at best, so the refusal is loud and named.
+            logger.info(
+                "refusing offer for attempt %s: model %r is not the advertised %r",
+                offer.attempt_id,
+                offer.model,
+                self._config.model,
+            )
+            return [
+                self._reject(
+                    reference,
+                    f"this node serves model {self._config.model!r}, "
+                    f"not {offer.model!r}",
+                )
+            ]
         with self._state.lock:
             existing = self._state.accepted.get(offer.attempt_id)
         if existing is not None:
@@ -591,8 +615,21 @@ class Connector:
         spool and the real state instead of a second upstream call. That is the
         guarantee that a reconnect or a re-dispatched message cannot
         double-consume the operator's upstream quota.
+
+        The row is consulted before the accepted offer, and the offer only ever
+        starts a new execution: an attempt that already has a row — a finished
+        one included — answers from the row, so retiring the in-memory offer
+        afterwards cannot turn a late EXECUTE into an ``unknown_attempt``.
         """
         attempt_id = reference.attempt_id
+        record = self._store.get_execution(attempt_id)
+        if record is not None:
+            # Already started. Re-drain any unacked spool; with nothing spooled,
+            # report what actually happened from the durable row.
+            resend = self._resend_envelopes(attempt_id)
+            if resend:
+                return resend
+            return [self._state_envelope(reference, record)]
         with self._state.lock:
             accepted = self._state.accepted.get(attempt_id)
         if accepted is None:
@@ -611,8 +648,9 @@ class Connector:
             at=_now(),
         )
         if not is_new:
-            # Already started. Re-drain any unacked spool; with nothing spooled,
-            # report what actually happened from the durable row.
+            # A racing EXECUTE inserted the row between the read above and this
+            # insert; the row is the truth, so answer from it exactly like any
+            # other duplicate rather than starting a second execution.
             resend = self._resend_envelopes(attempt_id)
             if resend:
                 return resend
@@ -657,18 +695,8 @@ class Connector:
         return []
 
     def _on_cancel(self, reference: AttemptRef) -> None:
-        """Signal a worker to stop, mark the execution, and drop its spool."""
-        attempt_id = reference.attempt_id
-        with self._state.lock:
-            event = self._state.cancel_events.get(attempt_id)
-            if event is None:
-                event = threading.Event()
-                self._state.cancel_events[attempt_id] = event
-        event.set()
-        record = self._store.get_execution(attempt_id)
-        if record is not None and record.finished_at is None:
-            self._store.finish_execution(attempt_id, "FAILED", at=_now())
-        self._drop_spool(attempt_id)
+        """Abandon the referenced attempt; see `_abandon_attempt`."""
+        self._abandon_attempt(reference.attempt_id)
 
     def _on_ack(self, ack: EventAck) -> None:
         """Retire the acknowledged contiguous prefix of an attempt's spool.
@@ -735,6 +763,16 @@ class Connector:
                 self._execute_streaming(accepted, reference, cancel_event)
             else:
                 self._execute_buffered(accepted, reference, cancel_event)
+        except StateTransitionError as exc:
+            # A CANCEL that landed mid-execution already wrote the terminal
+            # verdict, and the store refuses a second one. The first verdict
+            # stands; losing that race is logged rather than raised, because a
+            # worker thread dying over it would only print a traceback.
+            logger.warning(
+                "attempt %s finished concurrently while executing (%s)",
+                attempt_id,
+                exc,
+            )
         finally:
             with self._state.lock:
                 self._state.workers.pop(attempt_id, None)
@@ -831,6 +869,7 @@ class Connector:
         attempt_id = offer.attempt_id
         usage: NormalizedUsage | None = None
         emitted = False
+        dispatched = False
         chunks: Iterator[StreamChunk] | None = None
         try:
             try:
@@ -843,6 +882,19 @@ class Connector:
                     parameters=offer.parameters,
                 )
                 for chunk in chunks:
+                    if not dispatched:
+                        # The first pull is the dispatch: the request bytes are
+                        # on the wire and the upstream answered with headers, so
+                        # from here the call is a fact whatever happens next. A
+                        # cancel that stops the stream mid-way, or a stream that
+                        # ends with no text at all, must still count as a call
+                        # the operator's upstream really served — recording it as
+                        # never made is the mirror image of double-billing, and
+                        # the contract's §7.2 discipline forbids both.
+                        dispatched = True
+                        with self._state.lock:
+                            self._upstream_calls += 1
+                        self._store.record_upstream_call(attempt_id)
                     if cancel_event.is_set():
                         return
                     if chunk.usage is not None:
@@ -864,7 +916,9 @@ class Connector:
                 )
                 return
             except AdapterOutcomeUnknown as exc:
-                self._fail_with_unknown_outcome(attempt_id, exc)
+                self._fail_with_unknown_outcome(
+                    attempt_id, exc, already_recorded=dispatched
+                )
                 return
             except AdapterError as exc:
                 self._enqueue_upstream_failure(attempt_id, reference, exc)
@@ -875,14 +929,13 @@ class Connector:
             close = getattr(chunks, "close", None)
             if callable(close):
                 close()
-        with self._state.lock:
-            self._upstream_calls += 1
-        self._store.record_upstream_call(attempt_id)
         if cancel_event.is_set():
             return
         self._finish_success(accepted, reference, usage, cancel_event)
 
-    def _fail_with_unknown_outcome(self, attempt_id: str, exc: AdapterOutcomeUnknown) -> None:
+    def _fail_with_unknown_outcome(
+        self, attempt_id: str, exc: AdapterOutcomeUnknown, *, already_recorded: bool = False
+    ) -> None:
         """Record a dispatched-but-unanswered call without claiming either outcome.
 
         The adapter guarantees the request bytes were sent, so the submission is
@@ -895,10 +948,18 @@ class Connector:
         state instead, and its reconciliation turns `certainty="unknown"` into
         OUTCOME_UNKNOWN: usage stays unknown, never zero, nobody is billed, and
         no second upstream call is made.
+
+        Args:
+            attempt_id: The attempt whose outcome is unknown.
+            exc: The adapter's outcome-unknown error.
+            already_recorded: True when the caller already counted the dispatch
+                (a stream that recorded its first pull before failing later), so
+                the call is not counted twice.
         """
-        with self._state.lock:
-            self._upstream_calls += 1
-        self._store.record_upstream_call(attempt_id)
+        if not already_recorded:
+            with self._state.lock:
+                self._upstream_calls += 1
+            self._store.record_upstream_call(attempt_id)
         self._store.finish_execution(attempt_id, "UNKNOWN", at=_now())
 
     def _enqueue_upstream_failure(
@@ -956,6 +1017,15 @@ class Connector:
         """
         offer = accepted.offer
         attempt_id = offer.attempt_id
+        if cancel_event.is_set():
+            # A cancel that landed while the upstream call was finishing stops
+            # the report from being written at all, as the docstring promises:
+            # billing a consumer for a request they cancelled is the one charge
+            # this network must never make. The node's own
+            # `record_upstream_call` keeps the evidence that the operator's
+            # upstream really served the call, so the contributor's cost stays
+            # visible locally even though nothing is reported for settlement.
+            return
         resolved = usage or NormalizedUsage(
             input_total=0, output_total=0, completeness="unknown"
         )
@@ -995,8 +1065,6 @@ class Connector:
                 report=_signed_record_to_dict(report),
             ).to_payload(),
         )
-        if cancel_event.is_set():
-            return
         completed_seq = self._next_seq(attempt_id)
         self._enqueue(
             attempt_id,
@@ -1154,12 +1222,25 @@ class Connector:
             # Forgetting a fully drained, non-running attempt keeps the tracked
             # set bounded on a node that runs for weeks. A worker that spools a
             # new event adds the attempt back, so this can never lose an event.
+            #
+            # The durable execution row is the gate on what may be forgotten,
+            # checked per attempt rather than assumed: only a finished row
+            # proves no EXECUTE can still start work, because a duplicate
+            # EXECUTE for a finished row answers from the store instead of
+            # calling upstream. An accepted-but-never-executed attempt has no
+            # row yet — retiring its cancel event here would forget a CANCEL the
+            # server already sent, and the EXECUTE that follows would spend the
+            # operator's upstream quota on an attempt nobody wants.
             with self._state.lock:
                 for attempt_id in drained:
                     if attempt_id in self._state.workers:
                         continue
+                    execution = self._store.get_execution(attempt_id)
+                    if execution is None or execution.finished_at is None:
+                        continue
                     self._state.tracked.discard(attempt_id)
                     self._state.cancel_events.pop(attempt_id, None)
+                    self._state.accepted.pop(attempt_id, None)
 
     def _resend_envelopes(self, attempt_id: str) -> list[Envelope]:
         """Force a resend of every unacked spool entry for one attempt.
@@ -1195,20 +1276,63 @@ class Connector:
     def _abandon_attempt(self, attempt_id: str) -> None:
         """Stop work on an attempt, mark it failed, and drop its spool silently.
 
-        Used for both `cancel` and `abandon` directives. Nothing is sent for the
-        attempt: the server asked to end it, so the node does not manufacture a
-        terminal event for it.
+        Used for the `attempt.cancel` message and for both the `cancel` and the
+        `abandon` resume directive. Nothing is sent for the attempt: the server
+        asked to end it, so the node does not manufacture a terminal event for
+        it.
+
+        The FAILED verdict is made durable even when no execution row exists
+        yet. An accepted offer the server then abandoned must never reach its
+        upstream on a late EXECUTE, and only a finished row proves that to the
+        spool drain, which retires per-attempt in-memory state: a cancel event
+        living in memory alone is forgotten the moment the spool drains, and the
+        EXECUTE that follows would really call the upstream for an attempt
+        nobody wants. An attempt that was never accepted has no offer to derive
+        a row from and needs none — EXECUTE for an unaccepted attempt is refused
+        outright, so its in-memory event is the whole guard, and such an attempt
+        is never in the tracked set the drain retires.
         """
         with self._state.lock:
             event = self._state.cancel_events.get(attempt_id)
             if event is None:
                 event = threading.Event()
                 self._state.cancel_events[attempt_id] = event
+            accepted = self._state.accepted.get(attempt_id)
         event.set()
         record = self._store.get_execution(attempt_id)
-        if record is not None and record.finished_at is None:
+        if record is not None:
+            if record.finished_at is None:
+                self._finish_or_log(attempt_id, "FAILED")
+        elif accepted is not None:
+            offer = accepted.offer
+            self._store.begin_execution(
+                attempt_id=attempt_id,
+                request_id=offer.request_id,
+                epoch=offer.epoch,
+                request_digest=offer.request_digest,
+                at=_now(),
+            )
             self._store.finish_execution(attempt_id, "FAILED", at=_now())
         self._drop_spool(attempt_id)
+
+    def _finish_or_log(self, attempt_id: str, state: str) -> None:
+        """Write a terminal verdict, surviving a worker that finished first.
+
+        The socket loop and a worker thread can reach `finish_execution` for
+        the same attempt at the same moment — a CANCEL landing while the
+        upstream call is completing — and the store lets exactly one of them
+        win. Losing that race is not worth dropping the link over: the winner's
+        verdict stands and the books stay honest. It is still logged, because a
+        verdict that changed hands is something an operator should see.
+        """
+        try:
+            self._store.finish_execution(attempt_id, state, at=_now())
+        except StateTransitionError as exc:
+            logger.warning(
+                "attempt %s finished concurrently; the first verdict stands (%s)",
+                attempt_id,
+                exc,
+            )
 
     # ------------------------------------------------------------------ #
     # Envelope construction

@@ -710,7 +710,11 @@ class HttpUpstreamAdapter:
         top-level field rather than a turn. The forwarded parameters are merged
         after the fixed fields, so a parameter the requester named always wins
         over this adapter's own default — and ``max_tokens`` is therefore only a
-        default for the styles that require one.
+        default for the styles that require one. The merge can only ever carry
+        the platform's honoured parameter set: `decode_chat_parameters` drops
+        anything else on the node side too, so ``model``, ``messages``,
+        ``stream`` and ``stream_options`` — the request itself and the delivery
+        mode the server chose — stay the adapter's to set.
 
         Args:
             messages: The conversation to run.

@@ -716,6 +716,15 @@ def decode_chat_parameters(values: Any) -> dict[str, Any]:
     a request the platform accepted. Every other value keeps the type it was
     forwarded with.
 
+    Keys outside `CHAT_PARAMETER_KEYS` are dropped here as well as at the
+    encoder. The consumer-side encoder already filters, so on honest traffic
+    this changes nothing; it exists because the node must not trust the wire
+    more than the platform entry did. A center that injects ``model``,
+    ``messages``, ``stream`` or a field the platform promised not to forward
+    would otherwise have the node's adapter merge it straight into the upstream
+    body, and the contributor's credential would pay for a request the
+    consumer never signed.
+
     Args:
         values: The parameters an offer carried.
 
@@ -726,6 +735,8 @@ def decode_chat_parameters(values: Any) -> dict[str, Any]:
         return {}
     decoded: dict[str, Any] = {}
     for key, value in values.items():
+        if key not in CHAT_PARAMETER_KEYS:
+            continue
         if key in DECIMAL_CHAT_PARAMETERS and isinstance(value, str):
             decoded[key] = float(value)
         else:
