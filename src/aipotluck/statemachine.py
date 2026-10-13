@@ -44,6 +44,15 @@ RecoveryAction = Literal[
 TERMINAL_REQUEST_STATES: frozenset[str] = frozenset(
     {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}
 )
+#: Request states in which no node has been given the work yet. Only in these
+#: may an empty node listing say "nothing can run this": once a node holds an
+#: attempt it is demonstrably serving the request, and a node that pauses
+#: mid-flight must not be mistaken for a node that was never there. A request
+#: past these states is billed work, so ending it over a listing would stop the
+#: meter on the one request that is provably costing.
+PRE_DISPATCH_REQUEST_STATES: frozenset[str] = frozenset(
+    {"CREATED", "RESERVED", "ROUTING"}
+)
 TERMINAL_ATTEMPT_STATES: frozenset[str] = frozenset(
     {"COMPLETED", "FAILED", "CANCELLED", "OUTCOME_UNKNOWN", "REVOKED_BEFORE_SUBMIT"}
 )
