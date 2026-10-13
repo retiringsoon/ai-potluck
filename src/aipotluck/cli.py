@@ -51,7 +51,10 @@ Onboarding and consumer commands (the invite flow):
   need no further setup. A node join also receives the platform link token the
   server minted for it — returned once, stored in ``node_token.json`` (0600),
   never printed — so the contributor wizard needs no token an operator had to
-  copy over by hand.
+  copy over by hand. A consumer join on an invite minted ``--with-api-key``
+  receives an API key for the server's OpenAI-compatible endpoint instead:
+  printed once, on its own line, beside the ``base_url`` it belongs to, and
+  deliberately not written to a file this package would then have to protect.
 * ``ask`` is the one-command consumer path: it signs a request with the joined
   identity, dispatches it, waits for the answer, and prints the text and a cost
   line. Without ``--model`` it asks the server which models the online nodes
@@ -482,8 +485,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "key is never printed. With --node the server also issues this "
             "node's platform link token, which is saved to node_token.json "
             "(0600) and never printed; the contributor wizard then needs no "
-            "token from you. Re-running with the saved key is idempotent and "
-            "issues no second token."
+            "token from you. An invite the operator minted --with-api-key also "
+            "comes back with an API key for the server's OpenAI-compatible "
+            "endpoint, printed once on its own line and not saved here. "
+            "Re-running with the saved key is idempotent and issues no second "
+            "token and no second key."
         ),
     )
     join.add_argument("--server", required=True, help="Server base URL, e.g. http://host:port.")
@@ -1618,6 +1624,15 @@ def _cmd_join(args: argparse.Namespace) -> int:
     contributor loop: the wizard reads the token back from there, so nobody has
     to copy a credential out of ``server.json`` by hand. The token is shown
     once by the server and never echoed here.
+
+    A consumer join on an invite the operator minted ``--with-api-key``
+    additionally receives an API key for the server's OpenAI-compatible
+    endpoint, and that one *is* echoed — printed once, on its own line, with the
+    ``base_url`` it belongs to and the warning that it will never be shown
+    again. It is deliberately not written to a file: nothing this package runs
+    needs it (``ask`` and ``serve-openai`` sign with the identity key), so
+    storing it would only create a second place for it to be stolen from. Losing
+    it costs an operator round trip, not the identity.
     """
     directory = _config_dir(args.config_dir)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1683,6 +1698,13 @@ def _cmd_join(args: argparse.Namespace) -> int:
             "the server keeps only its digest, so if it is lost ask the operator to run "
             "`admin revoke-key` and re-join with a fresh invite"
         )
+    api_key = result.get("api_key")
+    if isinstance(api_key, str) and api_key:
+        # The key on its own line, so `potluck join … | grep '^ak-'` is a
+        # supported way to hand it to a tool, and the wording that explains it
+        # under it. Printed, never stored: see this command's docstring.
+        print(api_key)
+        print(f"{PROG}: {ux.joined_api_key_text(base_url=f'{server}/openai/v1')}")
     if args.node and not args.no_setup:
         # A node is only useful once it has an upstream and has proven it can
         # reach it, so the wizard runs right here rather than being a command

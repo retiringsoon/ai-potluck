@@ -155,6 +155,40 @@ def uncertain_usage_cost_text(*, receipt_id: str | None = None) -> str:
     return UNCERTAIN_USAGE_COST_TEXT
 
 
+def joined_api_key_text(*, base_url: str) -> str:
+    """Return the block ``join`` prints under an API key the invite issued.
+
+    An invite minted ``--with-api-key`` makes the server hand the joining client
+    an API key for its OpenAI-compatible endpoint, shown exactly once. This is
+    the wording that goes with it, in one place, because the two facts a user has
+    to come away with are easy to get wrong on a second surface: which
+    ``base_url`` the key is for, and that the server kept only a digest, so the
+    key cannot be read back later.
+
+    Args:
+        base_url: The OpenAI-compatible base URL this key authenticates against,
+            derived by the caller from the ``--server`` it joined against.
+            Naming it is the point of the block: a key with no endpoint beside it
+            is a credential the user still has to go and look up a path for.
+
+    Returns:
+        The wording, **without** the key. This module never handles a credential
+        — that is what keeps it safe to embed anywhere — so the caller prints the
+        key on its own line above this block.
+    """
+    return (
+        "this invite also issued an API key for the OpenAI-compatible endpoint "
+        "(the key is the line above this one):\n"
+        f"  base_url: {base_url}\n"
+        "  shown once; store it now — the server stored only its digest, so a "
+        "lost key is replaced by the operator, never recovered\n"
+        "  revoking it (`potluck-server admin api-key-revoke --key-id <id>`, and "
+        "`admin api-key-list` shows the id) withdraws this key alone: the "
+        "identity this join saved keeps signing requests, and its account keeps "
+        "its balance"
+    )
+
+
 class FailureKind(StrEnum):
     """The failure families the CLI can tell apart and advise on."""
 
