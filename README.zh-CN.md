@@ -1,34 +1,31 @@
 # ai-potluck
 
-[![ci](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml/badge.svg)](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml)
+> **共享算力与额度，而不是交出私钥与账密。**  
+> 专为极客、团队与开源社区打造的加密可验证 AI 拼车与协同网络。
 
+[![ci](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml/badge.svg)](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](pyproject.toml)
+
+*[English](README.md)* · [设计方案 (RFC)](docs/PROPOSAL.zh-CN.md) · [路线图](docs/ROADMAP.md)
+
+---
 
 ## 为什么做 ai-potluck
 
-社区里早已存在非正式的 AI 额度共享——群聊里贴一个朋友的 API key、一个团队席位被
-五个人"借用"、订阅卡被轮流刷。它有效，直到出事：没人说得清谁花了多少，出借的人
-承担全部风险，每场争执都结束于一句"你信我"。
+社区里早已存在非正式的 AI 额度共享——群聊里贴朋友的 API key、团队席位被几个人轮流借用、订阅卡轮着刷。它好用，直到发生事故：没人说得清谁花了多少，出借的人承担全部封号与账单风险，每一场费用争执最后都尴尬地止步于一句“你信我”。
 
-ai-potluck 把这套握手变成基础设施：
+**ai-potluck 把口头信任升级为密码学基础设施：**
 
-- **贡献者共享的是算力，不是凭据**：贡献者在本机跑 Connector，上游 key 永不出本机，
-  随时可以撤回共享。
-- **消费者按量付费，全程透明**：以 milli-credit 计费并有硬性预算上限——没有订阅，
-  没有押金，没有共享 key。
-- **每笔消耗都可证明**：每个回答产生签名收据与透明日志条目，任何人都能离线核验
-  （`potluck verify receipt`）——连中断的工作也是对账处理，而不是拍脑袋估计。
-- **中心服务器管账，但不掌权**：中心服务器负责路由、计量与结算；它看不到上游凭据，任何人
-  都可以拿公开账本复核它的算术。
+- 🛡️ **共享算力，绝不共享凭据**：贡献者在本机运行轻量 Connector。上游 API key **永不出本机**（仅存本地 `0600` 权限文件），随时 Ctrl-C 即可撤回共享。
+- 📜 **每笔消耗均密码学可证**：每个回答产生双方签名的收据与只增不改的 Merkle 透明日志条目。任何人都能离线核验（`potluck verify receipt`）——连意外中断的工作也是严谨对账，而不是拍脑袋估计。
+- ⚖️ **中心管账，但绝不掌权**：中心服务器负责路由、计量与确定性整数结算（milli-credit）；它碰不到上游凭据，任何客户端都能拿公开账本复核它的算术。
+- 🔌 **无缝接入 Claude Code、Cursor 与 OpenAI SDK**：只需一行 `potluck serve-openai`，本地回环地址立即提供签名代理，零改造接入你最熟悉的开发工具。
 
 供给采取邀请制与知情同意——见[供给合规](#供给合规)。
 
+本仓库是客户端：`potluck` 命令、Connector，以及协议与验证核心。模块划分遵循一条铁律——协议与验证原语全部置于 `ai-potluck`，客户端无需信任中心服务器即可独立核验收据；中心服务器记账与网关放在伴生仓库 [`ai-potluck-server`](https://github.com/retiringsoon/ai-potluck-server)（`potluck-server`），它依赖本包并导入相同的验证原语做账。
 
-本仓库是客户端：`potluck` 命令、Connector，以及协议与验证核心。模块划分只有一条
-规则——协议与验证原语放在 ai-potluck，客户端无需信任中心服务器即可核验收据；中心服务器记账与
-网关放在伴生仓库 [`ai-potluck-server`](../ai-potluck-server)（`potluck-server`），
-它依赖本包，并从 ai-potluck 导入验证原语来做自己的账。
-
-*[English](README.md)*
 
 ## 支持环境
 

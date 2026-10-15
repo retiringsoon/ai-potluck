@@ -1,42 +1,31 @@
 # ai-potluck
 
-[![ci](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml/badge.svg)](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml)
+> **Pool AI capacity, not credentials.**  
+> Cryptographically accounted, peer-contributed AI inference without sharing API keys.
 
+[![ci](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml/badge.svg)](https://github.com/retiringsoon/ai-potluck/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](pyproject.toml)
+
+*[中文说明](README.zh-CN.md)* · [Documentation](docs/) · [Roadmap](docs/ROADMAP.md)
+
+---
 
 ## Why ai-potluck
 
-Communities already share AI access informally — a friend's API key pasted into
-a group chat, a team seat "borrowed" by five people, a subscription passed
-around. It works until it doesn't: nobody can say who spent what, the person
-lending carries all the risk, and every dispute ends at "trust me".
+Communities already share AI access informally — pasting an API key into a group chat, "borrowing" a team seat, or passing around a subscription card. It works until it doesn't: nobody can say who spent what, the person lending carries all the financial and credential risk, and every dispute ends at "trust me."
 
-ai-potluck turns that handshake into infrastructure:
+**ai-potluck turns that handshake into cryptographic infrastructure:**
 
-- **Contributors pool capacity, not credentials.** A contributor runs a
-  connector on their own machine; upstream keys never leave it, and sharing is
-  revocable at any moment.
-- **Consumers pay per use, in the open.** Work is billed in milli-credits with
-  a hard budget ceiling — no subscriptions, no deposits, no key sharing.
-- **Every charge is provable.** Each answer produces a signed receipt and a
-  transparency-log entry anyone can verify offline (`potluck verify receipt`) —
-  and interrupted work is reconciled, not guessed.
-- **The server keeps the books, not the power.** It routes, meters, and
-  settles; it never sees an upstream credential, and clients can check its
-  arithmetic against the public ledger.
+- 🛡️ **Pool capacity, never credentials**: Contributors run a lightweight connector on their own machine. Upstream API keys **never leave your machine** (stored locally under file mode `0600`), and sharing is revocable at any second.
+- 📜 **Every charge is provable**: Every question produces an Ed25519-signed receipt and an append-only Merkle transparency log entry. Anyone can verify charges offline (`potluck verify receipt`) — interrupted work is reconciled cleanly, never guessed.
+- ⚖️ **The server keeps the books, not the power**: The server routes and settles in deterministic integer milli-credits. It never sees an upstream key, cannot forge receipts, and anyone can check its arithmetic against the public ledger.
+- 🔌 **Drop-in for Claude Code, Cursor & OpenAI SDK**: `potluck serve-openai` spins up a local loopback signing proxy (`127.0.0.1:8787`). Plug the pool into your daily tools with zero code modification and zero key leakage.
 
-Supply is invite-only and consent-based — see
-[Supply compliance](#supply-compliance).
+Supply is invite-only and consent-based — see [Supply compliance](#supply-compliance).
 
+This repository is the client side: the `potluck` command, the connector, and the protocol and verification core. Module layout follows one invariant: protocol and verification primitives live here in `ai-potluck`, so a client can verify a receipt without trusting the server; the server's bookkeeping and gateway live in the companion repository [`ai-potluck-server`](https://github.com/retiringsoon/ai-potluck-server) (`potluck-server`), which depends on this package and imports these verification primitives to keep its own books.
 
-This repository is the client side: the `potluck` command, the connector, and
-the protocol and verification core. Module layout follows one rule — the
-protocol and verification primitives live here in `ai-potluck`, so a client can
-verify a receipt without trusting the server; the server's bookkeeping and
-gateway live in the companion repository
-[`ai-potluck-server`](../ai-potluck-server) (`potluck-server`), which depends on
-this package and imports these verification primitives to keep its own books.
-
-*[中文说明](README.zh-CN.md)*
 
 ## Supported environments
 

@@ -97,7 +97,7 @@ from .cli import (
 from .deploy import SignedClient
 from .errors import PotluckError, ProtocolError
 from .statemachine import TERMINAL_REQUEST_STATES
-from .wire import ChatMessage, new_session_id
+from .wire import ChatMessage, check_session_id, new_session_id
 
 #: The address the endpoint binds unless told otherwise. A literal rather than
 #: ``localhost``: a name is resolved through host files this process does not
@@ -118,6 +118,17 @@ LOCAL_API_KEY_PLACEHOLDER: Final = "potluck-local-signing"
 #: wait rather than promising an outcome: the listener is already closed, and
 #: what is being waited for is the cancel, not the answer.
 SHUTDOWN_GRACE_S: Final = 2.0
+
+#: The read timeout on a client connection, in seconds. A loopback client that
+#: connects but stalls, or holds a keep-alive connection open without sending,
+#: must not occupy a server thread indefinitely: this endpoint serves with a
+#: ``ThreadingHTTPServer``, which opens one thread per connection and caps none,
+#: so an unbounded read would let a stalled connection pin a worker until the
+#: process is killed. The timeout is applied by ``BaseHTTPRequestHandler``'s own
+#: ``StreamRequestHandler.setup`` to the client socket. It bounds only reads of
+#: the request and the wait between keep-alive requests; the upstream wait is
+#: capped separately by ``EndpointSettings.timeout_s``.
+LOCAL_ENDPOINT_SOCKET_TIMEOUT_S: Final = 60.0
 
 #: Response headers naming the platform's own handles for one answer. A tool
 #: ignores headers it does not know, and these are what let an operator take an
@@ -759,6 +770,11 @@ def _handler_class(
         # declare.
         protocol_version = "HTTP/1.1"
 
+        # A stalled or idle client must not pin a worker thread forever (see
+        # `LOCAL_ENDPOINT_SOCKET_TIMEOUT_S`): the stdlib applies this to the
+        # socket in `setup`, so a slow read is cut off rather than awaited.
+        timeout = LOCAL_ENDPOINT_SOCKET_TIMEOUT_S
+
         # The state one response owns. Declared here and assigned in
         # `_begin_request` because a keep-alive connection reuses one handler
         # instance for many requests, so a constructor assignment would be both
@@ -979,7 +995,7 @@ def _handler_class(
             the only thing that differs between them, which is why there is one of
             these and not two.
             """
-            self._log_model = model
+            self._log_model = _safe_log_token(model)
             streaming = delivery_mode == "stream_strict"
             try:
                 request_id, body = build_signed_request(
@@ -1444,6 +1460,28 @@ def _is_json_content_type(value: str) -> bool:
     """
     media = value.split(";", 1)[0].strip().lower()
     return media == "application/json"
+
+
+def _safe_log_token(value: str) -> str:
+    """Return `value` for a log line, or a placeholder if it is not one token.
+
+    The request summary is printed to operators, so a value that carries a
+    newline or a control character could forge a line — or hide an entry — the
+    way a header or an operator command value could. The project's own rule,
+    `wire.check_session_id`, admits only one readable token of bounded length,
+    and that is the rule applied here for consistency: anything the operator
+    surface would refuse to carry is refused here too.
+
+    A value that fails is replaced with a placeholder rather than logged
+    verbatim. It still travels in the signed request — rewriting it would change
+    what this machine submits — so only the log representation is sanitized, and
+    a caller that named an odd model is answered normally.
+    """
+    try:
+        check_session_id(value)
+    except ProtocolError:
+        return "<invalid>"
+    return value
 
 
 def _not_supported_message(route: str) -> str:

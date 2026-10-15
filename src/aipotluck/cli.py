@@ -501,7 +501,7 @@ def _build_parser() -> argparse.ArgumentParser:
     join.add_argument(
         "--config-dir",
         type=Path,
-        default=None,
+        default=DEFAULT_CONFIG_DIR,
         dest="config_dir",
         metavar="DIR",
         help=f"Where to store the identity (default {DEFAULT_CONFIG_DIR}).",
@@ -553,7 +553,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ask.add_argument(
         "--config-dir",
         type=Path,
-        default=None,
+        default=DEFAULT_CONFIG_DIR,
         dest="config_dir",
         metavar="DIR",
         help=f"Where the identity lives (default {DEFAULT_CONFIG_DIR}).",
@@ -703,7 +703,7 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor.add_argument(
         "--config-dir",
         type=Path,
-        default=None,
+        default=DEFAULT_CONFIG_DIR,
         dest="config_dir",
         metavar="DIR",
         help=f"Where the identity lives (default {DEFAULT_CONFIG_DIR}).",
@@ -1013,7 +1013,7 @@ def _add_config_dir_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config-dir",
         type=Path,
-        default=None,
+        default=DEFAULT_CONFIG_DIR,
         dest="config_dir",
         metavar="DIR",
         help=f"Where local state lives (default {DEFAULT_CONFIG_DIR}).",
@@ -3723,9 +3723,9 @@ def _verify_receipt_as_consumer(directory: Path, receipt_id: str) -> ReceiptVeri
 def _cmd_verify_receipt(args: argparse.Namespace) -> int:
     """Run ``verify receipt``: the five-dimension check over one receipt.
 
-    The consumer view reads over HTTP under the joined identity, so
-    ``--config-dir`` is required; the operator view that opens a server's own
-    store is ``potluck-server verify receipt``.
+    The consumer view reads over HTTP under the joined identity (defaulting to
+    ``~/.aipotluck`` when ``--config-dir`` is omitted); the operator view that
+    opens a server's own store is ``potluck-server verify receipt``.
 
     Returns:
         0 when no dimension contradicted the record, 1 when one did. ``unknown``
@@ -3734,14 +3734,6 @@ def _cmd_verify_receipt(args: argparse.Namespace) -> int:
         — which never holds a signed usage report — look broken.
     """
     directory = args.config_dir
-    if directory is None:
-        print(
-            f"{PROG}: error: --config-dir is required; the consumer view reads over "
-            "HTTP as the joined identity (the operator view that reads a server's "
-            "own store is `potluck-server verify receipt --config`)",
-            file=sys.stderr,
-        )
-        return 2
     verification = _verify_receipt_as_consumer(_config_dir(directory), args.receipt_id)
     if args.json_output:
         print(canonicalize(verification.to_payload()).decode("utf-8"))
