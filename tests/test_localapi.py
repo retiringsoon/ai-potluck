@@ -37,14 +37,17 @@ from aipotluck.cli import main
 from aipotluck.identity import generate_key_pair
 from aipotluck.localapi import (
     LOCAL_API_KEY_PLACEHOLDER,
+    LOCAL_ENDPOINT_SOCKET_TIMEOUT_S,
     EndpointSettings,
     LocalEndpointServer,
     LocalIdentity,
     NonLoopbackBindError,
+    _handler_class,
+    _InFlight,
     require_loopback,
 )
 from aipotluck.statemachine import TERMINAL_REQUEST_STATES
-from aipotluck.wire import compute_request_digest, user_message
+from aipotluck.wire import compute_request_digest, new_session_id, user_message
 
 MODEL = "coding-pool"
 SUBJECT = "consumer-local-1"
@@ -1772,4 +1775,148 @@ def test_a_same_machine_request_without_origin_is_unaffected(
     assert status == 200
     assert document["choices"][0]["message"]["content"] == ANSWER
     assert len(server.admitted) == 1
+
+
+# --------------------------------------------------------------------------- #
+# P1-11: the local proxy must bound a client connection with a socket read timeout
+# --------------------------------------------------------------------------- #
+
+
+def test_the_endpoint_handler_configures_a_socket_read_timeout(
+    identity: Identity,
+) -> None:
+    """A stalled or idle client must not pin a worker thread forever.
+
+    `ThreadingHTTPServer` opens one thread per connection and caps none, so a
+    slow read would occupy a worker until the process is killed. The handler
+    sets `timeout`, which the stdlib's `StreamRequestHandler.setup` applies to
+    the client socket, cutting a slow read off rather than awaiting it.
+    """
+    handler = _handler_class(
+        identity=LocalIdentity.load(identity.directory),
+        settings=EndpointSettings(),
+        in_flight=_InFlight(),
+        session_id=new_session_id(),
+    )
+
+    assert handler.timeout == LOCAL_ENDPOINT_SOCKET_TIMEOUT_S
+    assert LOCAL_ENDPOINT_SOCKET_TIMEOUT_S > 0
+
+
+def test_a_stalled_client_connection_is_closed_after_the_read_timeout(
+    server: FakeServer,
+    endpoint: Callable[..., LocalEndpointServer],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client that connects but never sends is dropped, not held.
+
+    The production timeout (60s) is too long to wait on, so the module constant
+    is shortened for this test only; the handler reads it when it is built, so the
+    endpoint that comes up here carries the short bound. The harness's own socket
+    exposes the raw connection, so we can connect, send nothing, and confirm the
+    server closes the socket rather than holding a thread on it.
+
+    The assertion is on *when* the connection closes: if the server's read
+    timeout fired it drops the socket within the short bound, well before the
+    client's own 5s ceiling, so a held-open connection (which would only close
+    when the client gives up) cannot pass.
+    """
+    import aipotluck.localapi as localapi
+
+    monkeypatch.setattr(localapi, "LOCAL_ENDPOINT_SOCKET_TIMEOUT_S", 1.0)
+    endpoint_server = endpoint()
+
+    connection = _connect(endpoint_server)
+    connection.connect()
+    try:
+        connection.sock.settimeout(5.0)
+        started = time.monotonic()
+        closed = False
+        while True:
+            try:
+                chunk = connection.sock.recv(4096)
+            except OSError:
+                closed = True
+                break
+            if not chunk:
+                closed = True
+                break
+        elapsed = time.monotonic() - started
+    finally:
+        connection.close()
+
+    assert closed, "the server closed the idle connection"
+    assert elapsed < 3.0, f"closed by the server's read timeout, not the client ({elapsed:.1f}s)"
+    assert len(server.admitted) == 0, "an unsent request was never parsed or forwarded"
+
+
+# --------------------------------------------------------------------------- #
+# P2: a caller-controlled model string must not forge a log line
+# --------------------------------------------------------------------------- #
+
+
+def test_a_model_with_control_characters_is_not_logged_verbatim(
+    server: FakeServer,
+    endpoint: Callable[..., LocalEndpointServer],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A model carrying newlines/CR must never appear as its own log line.
+
+    The model is attacker-controlled and is printed in the request summary. A
+    value that is not one readable token is replaced with `<invalid>` in the log
+    (the same rule `wire.check_session_id` enforces), so it cannot forge a line
+    or hide an entry. It still travels in the signed request unaltered.
+    """
+    server.answer_with(deltas=DELTAS)
+    endpoint_server = endpoint()
+    bad_model = "good\r\nFAKE LOG LINE\r\nmodel=pwned"
+
+    _call(endpoint_server, "POST", "/v1/chat/completions", _chat(model=bad_model))
+
+    logged = ""
+
+    def _log_present() -> bool:
+        nonlocal logged
+        logged += capsys.readouterr().out
+        return "model=" in logged
+
+    _wait_until(_log_present)
+    # The malicious payload must never surface as a forged line.
+    assert "FAKE LOG LINE" not in logged
+    assert "model=pwned" not in logged
+    assert "model=<invalid>" in logged
+    # The odd model still reached the server unchanged (only the log is sanitized).
+    assert len(server.admitted) == 1
+    assert server.admitted[0]["model"] == bad_model
+
+
+def test_a_legal_model_is_logged_verbatim(
+    server: FakeServer,
+    endpoint: Callable[..., LocalEndpointServer],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A model that is one readable token is logged as the caller named it.
+
+    Pinned so the sanitizer cannot silently drop or mangle a legitimate name
+    (slashes and colons are part of real model ids and pass the token rule).
+    """
+    server.answer_with(deltas=DELTAS)
+    endpoint_server = endpoint()
+
+    _call(
+        endpoint_server,
+        "POST",
+        "/v1/chat/completions",
+        _chat(model="coding-pool/v1:2"),
+    )
+
+    logged = ""
+
+    def _log_present() -> bool:
+        nonlocal logged
+        logged += capsys.readouterr().out
+        return "model=" in logged
+
+    _wait_until(_log_present)
+    assert "model=coding-pool/v1:2" in logged
 
