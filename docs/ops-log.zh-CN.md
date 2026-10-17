@@ -2,6 +2,18 @@
 
 append-only：新条目加在顶部，不改旧文。
 
+## 2026-10-18 · 长程任务支持落地 + Operator 待办与架构决策手册
+
+- **长程任务 (Long-Horizon Tasks) 支持落地**：
+  1. `reasoning_effort` 参数正式纳入 `CHAT_PARAMETER_KEYS` 并通过 Canonical 规范化签名与端到端透传，全面支持 OpenAI o1/o3/o4 以及思考模型的长程深度推理控制。
+  2. `ChatMessage` 增加对 `name`、`tool_call_id`、`tool_calls` 的解析与序列化支持，多回合 Agent 循环（包含函数调用结果的回合）上下文不再被剥离破坏。
+  3. `HttpUpstreamAdapter` 增加 DeepSeek-R1 / QwQ 等思考模型流式 `reasoning_content` 的无损提取，彻底防止长程思考被误判为“empty completion”。
+  4. `potluck ask` 增加 `--session-id` 参数，允许 CLI 客户端与自动化脚本长程跨回合维护 Session 亲和性，享受服务端会话聚合与节点端 Hot KV Cache。
+  5. 新增 `tests/test_long_horizon_tasks.py` 覆盖 5 项长程核心特性，全量 1796（client）+ 528（server）测试 100% 通过。
+- **Operator 手动执行清单与架构决策手册**：
+  - 新增 `docs/operator-action-items.zh-CN.md`，梳理无需外部付费的 Telegram / 飞书 / Discord / GitHub 自动化机器人搭建清单。
+  - 列出 5 项核心架构决策（Tool Calling 演进、504 超时异步取回、多模型共存模式、社区守护集成、点数激励模型）供 Operator 随时决策与推进。
+
 ## 2026-10-13 · 分支策略变更：dev 只留本地
 
 - **规则（运营者明令，长期有效）**：dev 分支只在本地存在，**永不 push 到远程**；

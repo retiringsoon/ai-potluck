@@ -603,6 +603,11 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     ask.add_argument(
+        "--session-id",
+        default=None,
+        help="Agent session identifier to group turns and maintain node affinity.",
+    )
+    ask.add_argument(
         "--resume",
         action="store_true",
         help="Resume the pending request instead of starting one.",
@@ -2682,6 +2687,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
             max_charge=args.max_charge,
             delivery_mode=requested_mode,
             deadline_ms=int(args.timeout) * 1000,
+            session_id=args.session_id,
         )
         _write_pending(
             pending_path,

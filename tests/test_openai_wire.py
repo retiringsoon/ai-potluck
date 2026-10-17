@@ -114,7 +114,7 @@ def test_a_conversation_reaches_the_platform_turn_by_turn_and_verbatim() -> None
                 {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
             ),
         ),
-        ChatMessage(role="tool", content=None),
+        ChatMessage(role="tool", content=None, tool_call_id="call-1"),
     )
 
 

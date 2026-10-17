@@ -898,7 +898,11 @@ class HttpUpstreamAdapter:
             message = first.get("message")
             if not isinstance(message, dict):
                 raise AdapterError("openai choice has no message")
-            text = str(message.get("content", ""))
+            text = str(message.get("content", "") or "")
+            if not text:
+                reasoning = message.get("reasoning_content")
+                if reasoning:
+                    text = str(reasoning)
             raw_usage = payload.get("usage")
             usage = (
                 normalize_openai_usage(_as_mapping(raw_usage)) if raw_usage is not None else None
@@ -953,7 +957,12 @@ def _openai_delta_text(payload: dict[str, Any]) -> str:
     if not isinstance(delta, dict):
         return ""
     content = delta.get("content")
-    return "" if content is None else str(content)
+    if content is not None:
+        return str(content)
+    reasoning = delta.get("reasoning_content")
+    if reasoning is not None:
+        return str(reasoning)
+    return ""
 
 
 def _merge_anthropic_usage(
