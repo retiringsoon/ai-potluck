@@ -206,41 +206,50 @@ def cmd_daemon(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="ai-potluck Issue Resolver & Release Agent",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
+    common_parser = argparse.ArgumentParser(add_help=False)
+    common_parser.add_argument(
         "--repo",
         default="retiringsoon/ai-potluck",
         help="Target GitHub repository (owner/name)",
     )
-    parser.add_argument(
+    common_parser.add_argument(
         "--channel",
         default="github",
         choices=["github", "discord", "telegram", "feishu"],
         help="Intake channel source",
     )
-    parser.add_argument(
+    common_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Simulate remote Git push, PR creation, and issue edits without side-effects",
     )
-    parser.add_argument(
+    common_parser.add_argument(
         "--threshold",
         type=float,
         default=0.70,
         help="Autonomous agent approval confidence threshold (0.0 - 1.0)",
     )
 
+    parser = argparse.ArgumentParser(
+        description="ai-potluck Issue Resolver & Release Agent",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        parents=[common_parser],
+    )
+
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # list
-    p_list = subparsers.add_parser("list", help="List active issues")
+    p_list = subparsers.add_parser(
+        "list", help="List active issues", parents=[common_parser]
+    )
     p_list.add_argument("--state", default="open", choices=["open", "closed", "all"])
 
     # triage
-    p_triage = subparsers.add_parser("triage", help="Evaluate issue feasibility and approval gate")
+    p_triage = subparsers.add_parser(
+        "triage",
+        help="Evaluate issue feasibility and approval gate",
+        parents=[common_parser],
+    )
     p_triage.add_argument("issue_id", help="Issue number or identifier")
     p_triage.add_argument(
         "--force-human-approve",
@@ -249,7 +258,11 @@ def main() -> None:
     )
 
     # run
-    p_run = subparsers.add_parser("run", help="Run full pipeline: triage -> fix -> test -> release")
+    p_run = subparsers.add_parser(
+        "run",
+        help="Run full pipeline: triage -> fix -> test -> release",
+        parents=[common_parser],
+    )
     p_run.add_argument("issue_id", help="Issue number or identifier")
     p_run.add_argument(
         "--force-human-approve",
@@ -274,7 +287,9 @@ def main() -> None:
 
     # daemon
     p_daemon = subparsers.add_parser(
-        "daemon", help="Watch channel and auto-resolve approved issues"
+        "daemon",
+        help="Watch channel and auto-resolve approved issues",
+        parents=[common_parser],
     )
     p_daemon.add_argument("--interval", type=int, default=60, help="Polling interval in seconds")
 
